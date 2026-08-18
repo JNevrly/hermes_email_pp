@@ -1,5 +1,5 @@
 [project]
-name = "hermes_email_pp"
+name = "hermes-email-pp"
 version = "0.1.0"
 description = "Better email adapter for Hermes Agent."
 authors = [
@@ -7,20 +7,22 @@ authors = [
 ]
 license = { text = "MIT license" }
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.11,<3.14"
 classifiers = [
     "Development Status :: 2 - Pre-Alpha",
     "Intended Audience :: Developers",
     "Natural Language :: English",
     "Programming Language :: Python :: 3",
-    
-    
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
-    
-    
+    "hermes-agent @ git+https://github.com/NousResearch/hermes-agent.git@e02d1e41fc6104187e20af9eac8b2820566e3508",
 ]
+
+[project.entry-points."hermes_agent.plugins"]
+email-pp = "hermes_email_pp.plugin:register"
 
 [project.urls]
 Homepage = "https://github.com/JNevrly/hermes_email_pp"
@@ -50,7 +52,7 @@ fail_under = 100
 
 [tool.ruff]
 line-length = 88
-target-version = "py313"
+target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B"]
@@ -59,6 +61,9 @@ ignore = []
 [build-system]
 requires = ["hatchling>=1.27.0"]
 build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["hermes_email_pp"]
