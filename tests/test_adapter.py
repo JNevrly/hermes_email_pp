@@ -10,18 +10,37 @@ from types import SimpleNamespace
 import pytest
 
 from hermes_email_pp import adapter as adapter_module
-from hermes_email_pp.adapter import EmailPPAdapter, ThreadRoute, _address, _decode
+from hermes_email_pp.adapter import (
+    EmailPPAdapter,
+    ThreadRoute,
+    _address,
+    _decode,
+    _message_ids,
+)
+from hermes_email_pp.rendering import _SafeHTML
 
 
 class Router:
     def __init__(self) -> None:
         self.outbound: list[tuple[ThreadRoute, str]] = []
+        self.context: dict[str, dict[str, dict[str, str]]] = {}
 
     def resolve(self, sender: str, **kwargs: object) -> ThreadRoute:
         return ThreadRoute(sender, "email_pp:thread")
 
     def record_outbound(self, route: ThreadRoute, message_id: str) -> None:
         self.outbound.append((route, message_id))
+
+    def update_context(self, route: ThreadRoute, **kwargs: object) -> None:
+        context = self.context.setdefault(
+            route.thread_id, {"delivery_context": {}, "quote_source": {}}
+        )
+        for name, values in kwargs.items():
+            if values is not None:
+                context[name].update(values)
+
+    def context_for(self, route: ThreadRoute) -> dict[str, dict[str, str]] | None:
+        return self.context.get(route.thread_id)
 
 
 class IMAP:
@@ -76,6 +95,7 @@ def adapter(monkeypatch, tmp_path) -> EmailPPAdapter:
         "EMAIL_PP_PASSWORD",
         "EMAIL_PP_IMAP_HOST",
         "EMAIL_PP_SMTP_HOST",
+        "EMAIL_PP_QUOTE_MODE",
     ):
         monkeypatch.delenv(name, raising=False)
     return EmailPPAdapter(
@@ -95,6 +115,18 @@ def test_header_helpers_are_safe() -> None:
     assert _address("Name <USER@example.com>") == "user@example.com"
     assert _address("not an address") == ""
     assert _decode("=?unknown?b?aGVsbG8=?=") == "hello"
+    assert _message_ids("<one@example.com> <two@example.com>") == [
+        "<one@example.com>",
+        "<two@example.com>",
+    ]
+    assert _message_ids("<one@example.com>\nBcc: attacker@example.com") == []
+
+
+def test_html_sanitizer_drops_unknown_tags_and_preserves_safe_entities() -> None:
+    sanitizer = _SafeHTML()
+    sanitizer.feed('<img src="https://evil.example"><br/>&#169;')
+
+    assert "".join(sanitizer.parts) == "<br>&#169;"
 
 
 def test_tls_baseline_fetch_and_reconnect(adapter, monkeypatch) -> None:
@@ -173,6 +205,111 @@ def test_smtp_tls_and_explicit_route_send(adapter, monkeypatch, tmp_path) -> Non
             route.chat_id, str(attachment), reply_to="<inbound@example.com>"
         )
     ).success
+
+
+def test_rich_mime_quotes_safe_html_and_encoded_headers(
+    adapter, monkeypatch, tmp_path
+) -> None:
+    smtp = SMTP()
+    monkeypatch.setattr(adapter, "_smtp", lambda: smtp)
+    route = ThreadRoute("person@example.com", "email_pp:thread")
+    adapter._router.update_context(
+        route,
+        delivery_context={
+            "display_name": "Jos" + chr(0x00E9),
+            "subject": "Weekly caf" + chr(0x00E9),
+        },
+        quote_source={
+            "body": "<script>alert(1)</script>\n<img src=https://evil.example>",
+            "sender": "person@example.com",
+            "references": "<root@example.com> <inbound@example.com>",
+            "is_forwarded": "false",
+        },
+    )
+    content = """# Heading
+
+**bold** and *emphasis* with [safe](https://example.com) and [bad](javascript:alert(1)).
+
+- first
+- second
+
+Ordered:
+
+1. one
+2. two
+
+| name | value |
+| --- | --- |
+| a | b |
+
+`inline`
+
+```python
+print("code")
+```
+
+<form action="https://evil.example"><img src="https://evil.example"></form>"""
+    adapter._send_email(route, content, "<inbound@example.com>", None, None)
+
+    message = smtp.sent
+    assert message.get_content_type() == "multipart/alternative"
+    plain, rich = message.get_payload()
+    plain_body = plain.get_payload(decode=True).decode()
+    html_body = rich.get_payload(decode=True).decode()
+    assert "> <script>alert(1)</script>" in plain_body
+    for expected in ("<h1>", "<strong>", "<em>", "<ul>", "<ol>", "<table>", "<code>"):
+        assert expected in html_body
+    assert '<a href="https://example.com">safe</a>' in html_body
+    assert "javascript:" not in html_body
+    assert "<script" not in html_body
+    assert "<form" not in html_body
+    assert "<img" not in html_body
+    assert message["In-Reply-To"] == "<inbound@example.com>"
+    assert message["References"] == "<root@example.com> <inbound@example.com>"
+    assert b"=?utf-8?" in message.as_bytes()
+
+    attachment = tmp_path / "evidence.txt"
+    attachment.write_bytes(b"evidence")
+    adapter._send_email(route, "body", "<inbound@example.com>", attachment, None)
+
+    message = smtp.sent
+    assert message.get_content_type() == "multipart/mixed"
+    body, attachment_part = message.get_payload()
+    assert body.get_content_type() == "multipart/alternative"
+    assert [part.get_content_type() for part in body.get_payload()] == [
+        "text/plain",
+        "text/html",
+    ]
+    assert attachment_part.get_content_disposition() == "attachment"
+
+
+def test_quote_mode_defaults_validates_and_honors_forwarded_only(adapter) -> None:
+    route = ThreadRoute("person@example.com", "email_pp:thread")
+    adapter._router.update_context(
+        route,
+        quote_source={"body": "quoted", "sender": "person@example.com"},
+    )
+    assert adapter._quote_mode == "always"
+    adapter._quote_mode = "never"
+    assert "quoted" not in adapter._response_bodies(route, "body")[0]
+    adapter._quote_mode = "forwarded"
+    assert "quoted" not in adapter._response_bodies(route, "body")[0]
+    adapter._router.update_context(route, quote_source={"is_forwarded": "true"})
+    assert "quoted" in adapter._response_bodies(route, "body")[0]
+    with pytest.raises(ValueError, match="reply_to"):
+        adapter._send_email(route, "body", "not-a-message-id", None, None)
+    with pytest.raises(ValueError, match="EMAIL_PP_QUOTE_MODE"):
+        EmailPPAdapter(
+            SimpleNamespace(
+                extra={
+                    "address": "agent@example.com",
+                    "password": "secret",
+                    "imap_host": "imap.example.com",
+                    "smtp_host": "smtp.example.com",
+                    "quote_mode": "sometimes",
+                }
+            )
+        )
 
 
 def test_authorization_mime_and_dispatch(adapter, monkeypatch) -> None:

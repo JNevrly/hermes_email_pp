@@ -5,20 +5,21 @@ from __future__ import annotations
 import asyncio
 import email
 import imaplib
+import mimetypes
 import re
 import smtplib
 import ssl
 import uuid
 from email.header import decode_header
-from email.mime.application import MIMEApplication
-from email.mime.image import MIMEImage
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
+from email.headerregistry import Address
+from email.message import EmailMessage
+from email.policy import SMTP
 from email.utils import formatdate, parseaddr
 from pathlib import Path
 from typing import Any
 
 from hermes_email_pp.config import environment_settings
+from hermes_email_pp.rendering import quote_html, quote_plain, render_markdown
 from hermes_email_pp.threading import EmailThreadRouter, ThreadRoute
 
 try:
@@ -62,6 +63,8 @@ except ImportError:  # pragma: no cover - supports isolated package tests
 
 _AUTOMATED = ("noreply", "no-reply", "mailer-daemon", "postmaster", "bounce")
 _IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+_MESSAGE_ID = re.compile(r"<[^\s<>@]+@[^\s<>@]+>")
+_MESSAGE_IDS = re.compile(r"<[^\s<>@]+@[^\s<>@]+>(?:\s+<[^\s<>@]+@[^\s<>@]+>)*")
 
 
 def _decode(value: str) -> str:
@@ -83,6 +86,19 @@ def _address(value: str) -> str:
     _, address = parseaddr(value)
     address = address.strip().lower()
     return address if "@" in address and " " not in address else ""
+
+
+def _message_ids(value: object) -> list[str]:
+    """Return valid Message-IDs without permitting header injection."""
+    if not isinstance(value, str) or "\r" in value or "\n" in value:
+        return []
+    return _MESSAGE_ID.findall(value) if _MESSAGE_IDS.fullmatch(value.strip()) else []
+
+
+def _display_name(value: str) -> str:
+    """Extract a header-safe display name from a decoded mailbox header."""
+    name, _ = parseaddr(_decode(value))
+    return name.replace("\r", "").replace("\n", "").strip()
 
 
 class EmailPPAdapter(BasePlatformAdapter):
@@ -132,6 +148,7 @@ class EmailPPAdapter(BasePlatformAdapter):
         self._authserv_id = self._setting(
             settings, extra, "EMAIL_PP_AUTHSERV_ID", "authserv_id"
         )
+        self._quote_mode = self._parse_quote_mode(settings, extra)
         self._seen: set[bytes] = set()
         self._poll_task: asyncio.Task[None] | None = None
         self._routes: dict[tuple[str, str], ThreadRoute] = {}
@@ -149,6 +166,16 @@ class EmailPPAdapter(BasePlatformAdapter):
             return int(cls._setting(settings, extra, env, key))
         except ValueError:
             return default
+
+    @classmethod
+    def _parse_quote_mode(cls, settings: dict[str, str], extra: Any) -> str:
+        mode = cls._setting(settings, extra, "EMAIL_PP_QUOTE_MODE", "quote_mode")
+        mode = mode.lower() or "always"
+        if mode not in {"always", "forwarded", "never"}:
+            raise ValueError(
+                "EMAIL_PP_QUOTE_MODE must be one of: always, forwarded, never"
+            )
+        return mode
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Validate both TLS transports and begin asynchronous mailbox polling."""
@@ -278,6 +305,23 @@ class EmailPPAdapter(BasePlatformAdapter):
         if message_id:
             self._routes[(sender, message_id)] = route
         text, urls, types, message_type = self._content(message)
+        message_ids = _message_ids(message_id)
+        references = _message_ids(message.get("References", ""))
+        if message_ids:
+            references.append(message_ids[0])
+        self._router.update_context(
+            route,
+            delivery_context={
+                "display_name": _display_name(message.get("From", sender)),
+                "subject": _decode(message.get("Subject", "")),
+            },
+            quote_source={
+                "body": text[:100_000],
+                "sender": sender,
+                "references": " ".join(dict.fromkeys(references)),
+                "is_forwarded": "false",
+            },
+        )
         source = self.build_source(
             chat_id=route.chat_id,
             chat_name=_decode(message.get("From", sender)),
@@ -419,6 +463,21 @@ class EmailPPAdapter(BasePlatformAdapter):
         except (OSError, smtplib.SMTPException, ValueError) as error:
             return SendResult(success=False, error=str(error))
 
+    def _response_bodies(self, route: ThreadRoute, content: str) -> tuple[str, str]:
+        """Render a response and add a quote only when its mode permits it."""
+        context = self._router.context_for(route) or {}
+        quote_source = context.get("quote_source", {})
+        quote = str(quote_source.get("body", ""))
+        include_quote = self._quote_mode == "always" or (
+            self._quote_mode == "forwarded"
+            and quote_source.get("is_forwarded") == "true"
+        )
+        html_body = render_markdown(content)
+        if not include_quote or not quote:
+            return content, html_body
+        sender = str(quote_source.get("sender", route.chat_id))
+        return quote_plain(content, quote, sender), quote_html(html_body, quote, sender)
+
     def _send_email(
         self,
         route: ThreadRoute,
@@ -427,29 +486,43 @@ class EmailPPAdapter(BasePlatformAdapter):
         attachment: Path | None,
         file_name: str | None,
     ) -> str:
-        message = MIMEMultipart()
-        message["From"] = self._address
-        message["To"] = route.chat_id
-        message["Subject"] = "Re: Hermes Agent"
-        message["In-Reply-To"] = reply_to
-        message["References"] = reply_to
+        reply_ids = _message_ids(reply_to)
+        if len(reply_ids) != 1:
+            raise ValueError("reply_to must be one valid RFC Message-ID")
+        context = self._router.context_for(route) or {}
+        delivery = context.get("delivery_context", {})
+        quote_source = context.get("quote_source", {})
+        plain_body, html_body = self._response_bodies(route, content)
+
+        subject = str(delivery.get("subject", "")).strip()
+        if not subject.lower().startswith("re:"):
+            subject = f"Re: {subject}" if subject else "Re: Hermes Agent"
+        recipient_name = str(delivery.get("display_name", ""))
+        message = EmailMessage(policy=SMTP)
+        message["From"] = Address(display_name="Hermes Agent", addr_spec=self._address)
+        message["To"] = Address(display_name=recipient_name, addr_spec=route.chat_id)
+        message["Subject"] = subject
+        message["In-Reply-To"] = reply_ids[0]
+        references = _message_ids(str(quote_source.get("references", "")))
+        message["References"] = " ".join(dict.fromkeys([*references, reply_ids[0]]))
         message["Date"] = formatdate(localtime=True)
         message_id = f"<hermes-{uuid.uuid4().hex}@{self._address.rsplit('@', 1)[-1]}>"
         message["Message-ID"] = message_id
-        message.attach(MIMEText(content, "plain", "utf-8"))
+        message.set_content(plain_body, charset="utf-8")
+        message.add_alternative(html_body, subtype="html", charset="utf-8")
         if attachment is not None:
             data = attachment.read_bytes()
-            part = (
-                MIMEImage(data)
-                if attachment.suffix.lower() in {".jpg", ".jpeg", ".png", ".gif"}
-                else MIMEApplication(data)
+            content_type, _ = mimetypes.guess_type(file_name or attachment.name)
+            maintype, subtype = (content_type or "application/octet-stream").split(
+                "/", 1
             )
-            part.add_header(
-                "Content-Disposition",
-                "attachment",
+            message.make_mixed()
+            message.add_attachment(
+                data,
+                maintype=maintype,
+                subtype=subtype,
                 filename=file_name or attachment.name,
             )
-            message.attach(part)
         smtp = self._smtp()
         try:
             smtp.login(self._address, self._password)

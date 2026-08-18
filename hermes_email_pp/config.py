@@ -22,6 +22,7 @@ OPTIONAL_ENV = (
     "EMAIL_PP_ALLOW_ALL_USERS",
     "EMAIL_PP_REQUIRE_AUTHENTICATED_SENDER",
     "EMAIL_PP_AUTHSERV_ID",
+    "EMAIL_PP_QUOTE_MODE",
 )
 
 _CONFIG_KEYS = {
@@ -35,6 +36,7 @@ _CONFIG_KEYS = {
     "EMAIL_PP_MAILBOX": "mailbox",
     "EMAIL_PP_REQUIRE_AUTHENTICATED_SENDER": "require_authenticated_sender",
     "EMAIL_PP_AUTHSERV_ID": "authserv_id",
+    "EMAIL_PP_QUOTE_MODE": "quote_mode",
 }
 
 

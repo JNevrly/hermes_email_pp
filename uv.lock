@@ -436,6 +436,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "hermes-agent" },
+    { name = "markdown" },
 ]
 
 [package.dev-dependencies]
@@ -449,7 +450,10 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "hermes-agent", git = "https://github.com/NousResearch/hermes-agent.git?rev=e02d1e41fc6104187e20af9eac8b2820566e3508" }]
+requires-dist = [
+    { name = "hermes-agent", git = "https://github.com/NousResearch/hermes-agent.git?rev=e02d1e41fc6104187e20af9eac8b2820566e3508" },
+    { name = "markdown", specifier = ">=3.10,<4.0" },
+]
 
 [package.metadata.requires-dev]
 dev = [

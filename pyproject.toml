@@ -19,6 +19,7 @@ classifiers = [
 ]
 dependencies = [
     "hermes-agent @ git+https://github.com/NousResearch/hermes-agent.git@e02d1e41fc6104187e20af9eac8b2820566e3508",
+    "markdown>=3.10,<4.0",
 ]
 
 [project.entry-points."hermes_agent.plugins"]

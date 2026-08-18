@@ -32,7 +32,8 @@ def test_project_declares_email_pp_entry_point() -> None:
     assert project["project"]["dependencies"] == [
         "hermes-agent @ "
         "git+https://github.com/NousResearch/hermes-agent.git@"
-        "e02d1e41fc6104187e20af9eac8b2820566e3508"
+        "e02d1e41fc6104187e20af9eac8b2820566e3508",
+        "markdown>=3.10,<4.0",
     ]
 
 
@@ -66,6 +67,7 @@ def test_configuration_accepts_email_pp_environment(monkeypatch) -> None:
     ):
         monkeypatch.setenv(name, value)
     monkeypatch.setenv("EMAIL_PP_IMAP_PORT", "993")
+    monkeypatch.setenv("EMAIL_PP_QUOTE_MODE", "forwarded")
 
     assert is_configured(SimpleNamespace(extra={}))
     assert environment_enablement() == {
@@ -74,6 +76,7 @@ def test_configuration_accepts_email_pp_environment(monkeypatch) -> None:
         "imap_host": "imap.example.com",
         "smtp_host": "smtp.example.com",
         "imap_port": "993",
+        "quote_mode": "forwarded",
     }
 
 
