@@ -201,6 +201,11 @@ def test_smtp_tls_and_explicit_route_send(adapter, monkeypatch, tmp_path) -> Non
     assert result.success
     assert adapter._router.outbound
     assert secure.sent["To"] == route.chat_id
+    assert asyncio.run(adapter.get_chat_info(route.chat_id)) == {
+        "name": route.chat_id,
+        "type": "dm",
+        "chat_id": route.chat_id,
+    }
     assert not asyncio.run(adapter.send("other@example.com", "no route")).success
     assert asyncio.run(
         adapter.send_image(

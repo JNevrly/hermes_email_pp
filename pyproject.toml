@@ -18,12 +18,12 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
-    "hermes-agent @ git+https://github.com/NousResearch/hermes-agent.git@e02d1e41fc6104187e20af9eac8b2820566e3508",
+    "hermes-agent>=0.19,<0.20",
     "markdown>=3.10,<4.0",
 ]
 
 [project.entry-points."hermes_agent.plugins"]
-email-pp = "hermes_email_pp.plugin:register"
+email-pp = "hermes_email_pp.plugin"
 
 [project.urls]
 Homepage = "https://github.com/JNevrly/hermes_email_pp"
@@ -68,3 +68,6 @@ allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["hermes_email_pp"]
+
+[tool.hatch.build.targets.sdist]
+include = ["hermes_email_pp", "LICENSE", "README.md", "pyproject.toml"]

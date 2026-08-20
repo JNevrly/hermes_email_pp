@@ -30,8 +30,8 @@ from hermes_email_pp.rendering import quote_html, quote_plain, render_markdown
 from hermes_email_pp.threading import EmailThreadRouter, ThreadRoute
 
 try:
-    from gateway.config import Platform  # type: ignore[import-not-found]
-    from gateway.platforms.base import (  # type: ignore[import-not-found]  # pragma: no cover
+    from gateway.config import Platform  # type: ignore[import-not-found,import-untyped]
+    from gateway.platforms.base import (  # type: ignore[import-not-found,import-untyped]  # pragma: no cover
         BasePlatformAdapter,
         MessageEvent,
         MessageType,
@@ -520,6 +520,10 @@ class EmailPPAdapter(BasePlatformAdapter):
         return await self._send_parts(
             chat_id, caption or "", reply_to, Path(audio_path)
         )
+
+    async def get_chat_info(self, chat_id: str) -> dict[str, str]:
+        """Return the address-based metadata required by Hermes adapters."""
+        return {"name": chat_id, "type": "dm", "chat_id": chat_id}
 
     async def _send_parts(
         self,

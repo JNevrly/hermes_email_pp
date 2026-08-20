@@ -26,13 +26,11 @@ def test_project_declares_email_pp_entry_point() -> None:
     project = tomllib.loads(Path("pyproject.toml").read_text())
 
     assert project["project"]["entry-points"]["hermes_agent.plugins"] == {
-        "email-pp": "hermes_email_pp.plugin:register"
+        "email-pp": "hermes_email_pp.plugin"
     }
     assert project["project"]["requires-python"] == ">=3.11,<3.14"
     assert project["project"]["dependencies"] == [
-        "hermes-agent @ "
-        "git+https://github.com/NousResearch/hermes-agent.git@"
-        "e02d1e41fc6104187e20af9eac8b2820566e3508",
+        "hermes-agent>=0.19,<0.20",
         "markdown>=3.10,<4.0",
     ]
 
@@ -212,7 +210,7 @@ def test_threading_header_validation_and_profile_home_resolution(
         "<two@example.com>",
     ]
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.delitem(sys.modules, "hermes_constants", raising=False)
+    monkeypatch.setitem(sys.modules, "hermes_constants", None)
 
     assert email_threading.active_profile_home() == tmp_path
     hermes_constants = ModuleType("hermes_constants")

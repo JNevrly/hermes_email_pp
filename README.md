@@ -1,27 +1,170 @@
-# Email plus plus
-
+# Hermes Email++
 
 [![PyPI](https://img.shields.io/pypi/v/hermes_email_pp.svg)](https://pypi.python.org/pypi/hermes_email_pp)
-
 [![CI](https://github.com/JNevrly/hermes_email_pp/actions/workflows/ci.yml/badge.svg)](https://github.com/JNevrly/hermes_email_pp/actions/workflows/ci.yml)
 
+Hermes Email++ is a third-party IMAP/SMTP platform adapter for Hermes Agent.
+It is registered as `email_pp`, independently of Hermes' built-in `email`
+platform. It routes each RFC email thread to its own Hermes session, sends
+plain-text and HTML email, and supports a review-draft workflow for common
+inline forwards.
 
+## Installation And Enablement
 
-
-
-
-Better email adapter for Hermes Agent.
-
-
-* Free software: MIT license
-
-
-## Installation
+Install this package into the same Python environment as a supported Hermes
+Agent 0.19 release:
 
 ```console
-$ pip install hermes_email_pp
+$ python -m pip install hermes-email-pp
+$ hermes plugins enable email-pp
 ```
 
-## Features
+Pip-installed plugins are discovered through the `hermes_agent.plugins` entry
+point. Enabling `email-pp` explicitly permits this third-party code to load.
+Restart the gateway after installing or changing configuration. `hermes plugins
+list` shows discovery and enablement, and `hermes gateway status` shows the
+registered and connected platforms.
 
-* TODO
+Put the credentials in the active Hermes profile's `~/.hermes/.env` (or the
+profile-specific equivalent):
+
+```dotenv
+EMAIL_PP_ADDRESS=agent@example.com
+EMAIL_PP_PASSWORD=an-app-password
+EMAIL_PP_IMAP_HOST=imap.example.com
+EMAIL_PP_SMTP_HOST=smtp.example.com
+EMAIL_PP_ALLOWED_USERS=operator@example.com
+EMAIL_PP_REQUIRE_AUTHENTICATED_SENDER=true
+```
+
+All four required variables must be non-empty before environment-driven
+configuration enables Email++. The `EMAIL_PP_*` namespace is deliberately
+isolated: built-in `EMAIL_*` credentials are never read.
+
+Enable the Email++ gateway platform in `~/.hermes/config.yaml` when it is not
+auto-enabled from the complete required environment configuration:
+
+```yaml
+gateway:
+  platforms:
+    email_pp:
+      enabled: true
+```
+
+For a mailbox shared with the built-in adapter, use **only one** adapter. Keep
+the `EMAIL_*` credentials absent and disable `email` in the gateway
+configuration before enabling Email++ with its `EMAIL_PP_*` credentials. Two
+adapters polling the same mailbox can race, duplicate processing, or send
+conflicting replies.
+
+### Settings
+
+Environment variables take precedence over matching `extra` values in the
+Email++ platform configuration.
+
+| Setting | Required | Default | Meaning |
+| --- | --- | --- | --- |
+| `EMAIL_PP_ADDRESS` | Yes | - | Agent mailbox address and SMTP envelope identity. |
+| `EMAIL_PP_PASSWORD` | Yes | - | IMAP/SMTP password or provider-issued app password. |
+| `EMAIL_PP_IMAP_HOST` | Yes | - | IMAP server hostname. |
+| `EMAIL_PP_SMTP_HOST` | Yes | - | SMTP server hostname. |
+| `EMAIL_PP_IMAP_PORT` | No | `993` | IMAP-over-TLS port. |
+| `EMAIL_PP_SMTP_PORT` | No | `587` | SMTP STARTTLS port; use `465` for implicit TLS. |
+| `EMAIL_PP_POLL_INTERVAL` | No | `15` | Inbox polling interval in seconds; values below one second are treated as one second. |
+| `EMAIL_PP_MAILBOX` | No | `INBOX` | Mailbox selected for polling. |
+| `EMAIL_PP_ALLOWED_USERS` | No | empty | Comma-separated sender-address allowlist. Required unless `EMAIL_PP_ALLOW_ALL_USERS` is enabled. |
+| `EMAIL_PP_ALLOW_ALL_USERS` | No | `false` | Accept every non-automated sender. This also bypasses sender-authentication checks; do not use for an Internet-facing mailbox. |
+| `EMAIL_PP_REQUIRE_AUTHENTICATED_SENDER` | No | `true` | Require a passing DMARC result in `Authentication-Results` for allowlisted senders. |
+| `EMAIL_PP_AUTHSERV_ID` | No | empty | Optional authentication-service identifier that must prefix the trusted `Authentication-Results` header. |
+| `EMAIL_PP_QUOTE_MODE` | No | `always` | `always` quotes the source email, `forwarded` quotes only parsed forwards, and `never` omits visible quotes. |
+
+## Email Behavior
+
+### Ordinary Replies
+
+Each RFC thread is mapped to a private Hermes thread. `Message-ID`,
+`References`, and `In-Reply-To` preserve continuity across replies and gateway
+restarts. Replies include both `text/plain` and safe `text/html` alternatives.
+The selected quote mode controls whether the original content is visibly
+quoted; normal replies retain RFC `In-Reply-To` and `References` headers.
+
+The adapter rejects automated mail, self-mail, malformed message-ID headers,
+senders outside the allowlist, and (by default) messages without a passing
+DMARC result. It only sends when Hermes supplies a known sender and reply
+route, preventing arbitrary outbound email addresses from being used as a
+delivery target.
+
+### Forwarded Review Drafts
+
+Email++ recognizes English inline forwards in these forms:
+
+```text
+---------- Forwarded message ---------
+```
+
+```text
+-----Original Message-----
+```
+
+Use a short task prompt before the boundary, followed by a complete forwarded
+message with at least `From`, `Subject`, and a non-empty body. The first Hermes
+response is sent to the forwarder as a separate email with subject
+`Draft: Re: <original subject>`; it does not reply to the original
+correspondent and has no original-thread reply headers. The visible quote
+contains only the original message, never the wrapper task prompt. A reply to
+that draft stays in the same Hermes session and is sent as a normal revision.
+
+Only English Gmail and Outlook inline forwards matching the boundaries above
+are supported. Attachments-as-forwards, localized client formatting, nested or
+ambiguous forwards, and forwards without the required headers/body are not
+parsed. A suspected forward that cannot be parsed receives a safe notice and
+creates no draft or agent task. This fail-closed behavior prevents wrapper text
+or untrusted forwarded content from being mistaken for an instruction.
+
+## Security And Data Handling
+
+- Use a dedicated mailbox and a least-privilege provider app password, not a
+  primary account password. Restrict IMAP/SMTP access to TLS-enabled endpoints.
+- Store secrets in the Hermes profile `.env` with owner-only filesystem
+  permissions or use the deployment platform's secret store. Never commit the
+  `.env` file or app password.
+- Use a small, explicit `EMAIL_PP_ALLOWED_USERS` list. Leave
+  `EMAIL_PP_ALLOW_ALL_USERS` unset, and keep authenticated-sender verification
+  enabled. Set `EMAIL_PP_AUTHSERV_ID` when the receiving infrastructure has a
+  known authentication-results service.
+- Treat sender authentication as a mailbox-side defense, not proof that email
+  content is trustworthy. Forwarded message bodies are reference data and are
+  explicitly separated from the authorized task prompt.
+- Inbound attachments are written to temporary files and exposed to Hermes as
+  media URLs; the adapter does not scan, size-limit, or delete them itself.
+  Apply mailbox-provider malware controls, restrict tool access for the Email++
+  platform, and clean the host temporary directory according to local policy.
+- Thread routing, delivery details, quote sources, and draft context are kept
+  locally at `~/.hermes/email_pp/threads.json` (or the active `HERMES_HOME`).
+  The directory is mode `0700` and the state file is mode `0600`, but it is not
+  encrypted. It is bounded to 500 threads and a 90-day retention period; back
+  up or purge it according to the mailbox's data-retention policy.
+
+## Limitations
+
+The adapter polls one IMAP mailbox and supports IMAP-over-TLS plus SMTP
+STARTTLS or implicit SMTP TLS. It does not provide mailbox synchronization,
+server-side draft storage, attachment malware scanning, arbitrary outbound
+mail, non-English forward parsing, or direct delivery to an original
+forwarded-message sender.
+
+## Development Validation
+
+Run the complete release checks from a clean checkout:
+
+```console
+$ uv run ruff check .
+$ uv run ruff format --check .
+$ uv run mypy hermes_email_pp
+$ uv run pytest --cov=hermes_email_pp tests/
+$ uv build --out-dir dist --clear
+```
+
+The release smoke test installs the built wheel with a supported Hermes Agent
+0.19 release, then confirms the `email-pp` entry point loads without replacing
+the built-in `email` registration.
