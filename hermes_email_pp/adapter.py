@@ -19,6 +19,13 @@ from pathlib import Path
 from typing import Any
 
 from hermes_email_pp.config import environment_settings
+from hermes_email_pp.forwarding import (
+    ForwardedMessage,
+    hermes_prompt,
+    html_to_text,
+    is_suspected_forward,
+    parse_forward,
+)
 from hermes_email_pp.rendering import quote_html, quote_plain, render_markdown
 from hermes_email_pp.threading import EmailThreadRouter, ThreadRoute
 
@@ -305,22 +312,38 @@ class EmailPPAdapter(BasePlatformAdapter):
         if message_id:
             self._routes[(sender, message_id)] = route
         text, urls, types, message_type = self._content(message)
+        alternatives = self._text_alternatives(message)
+        subject = _decode(message.get("Subject", ""))
         message_ids = _message_ids(message_id)
         references = _message_ids(message.get("References", ""))
         if message_ids:
             references.append(message_ids[0])
+        forward = self._forward(alternatives)
+        if forward is None and is_suspected_forward(subject, alternatives):
+            self._router.update_context(
+                route,
+                delivery_context={
+                    "display_name": _display_name(message.get("From", sender)),
+                    "subject": subject,
+                },
+                quote_source={"body": "", "is_forwarded": "false"},
+                draft_context={"is_forwarded": "false", "draft_sent": "true"},
+            )
+            await self._send_unsafe_forward_notice(route, message_id)
+            return
         self._router.update_context(
             route,
             delivery_context={
                 "display_name": _display_name(message.get("From", sender)),
-                "subject": _decode(message.get("Subject", "")),
+                "subject": subject,
             },
             quote_source={
-                "body": text[:100_000],
-                "sender": sender,
+                "body": (forward.quote if forward else text)[:100_000],
+                "sender": forward.original_sender if forward else sender,
                 "references": " ".join(dict.fromkeys(references)),
-                "is_forwarded": "false",
+                "is_forwarded": str(bool(forward)).lower(),
             },
+            draft_context=self._draft_context(forward),
         )
         source = self.build_source(
             chat_id=route.chat_id,
@@ -333,7 +356,7 @@ class EmailPPAdapter(BasePlatformAdapter):
         )
         await self.handle_message(
             MessageEvent(
-                text=text or "(empty email)",
+                text=hermes_prompt(forward) if forward else text or "(empty email)",
                 message_type=message_type,
                 source=source,
                 message_id=message_id or None,
@@ -342,6 +365,64 @@ class EmailPPAdapter(BasePlatformAdapter):
                 media_types=types,
             )
         )
+
+    @staticmethod
+    def _text_alternatives(message: Any) -> list[str]:
+        alternatives: list[str] = []
+        for part in message.walk() if message.is_multipart() else [message]:
+            if "attachment" in str(part.get("Content-Disposition", "")):
+                continue
+            content_type = part.get_content_type()
+            if content_type not in {"text/plain", "text/html"}:
+                continue
+            payload = part.get_payload(decode=True) or b""
+            body = payload.decode(
+                part.get_content_charset() or "utf-8", errors="replace"
+            )
+            alternatives.append(
+                html_to_text(body) if content_type == "text/html" else body
+            )
+        return alternatives
+
+    @staticmethod
+    def _forward(alternatives: list[str]) -> ForwardedMessage | None:
+        return next(
+            (forward for body in alternatives if (forward := parse_forward(body))), None
+        )
+
+    @staticmethod
+    def _draft_context(forward: ForwardedMessage | None) -> dict[str, str]:
+        if forward is None:
+            return {"is_forwarded": "false", "draft_sent": "true"}
+        return {
+            "is_forwarded": "true",
+            "draft_sent": "false",
+            "task_prompt": forward.task_prompt[:100_000],
+            "original_sender": forward.original_sender,
+            "original_date": forward.original_date,
+            "original_to": forward.original_to,
+            "original_cc": forward.original_cc,
+            "original_subject": forward.original_subject,
+            "original_body": forward.original_body[:100_000],
+        }
+
+    async def _send_unsafe_forward_notice(
+        self, route: ThreadRoute, message_id: str
+    ) -> None:
+        reply_ids = _message_ids(message_id)
+        if len(reply_ids) != 1:
+            return
+        content = (
+            "I could not safely identify the boundary between your task and "
+            "the forwarded message, so no review draft was created. Please "
+            "resend it with a separate task prompt followed by a complete "
+            "Gmail or Outlook inline forward."
+        )
+        sent = await asyncio.to_thread(
+            self._send_email, route, content, reply_ids[0], None, None
+        )
+        self._routes[(route.chat_id, sent)] = route
+        self._router.record_outbound(route, sent)
 
     def _permitted(self, sender: str, message: Any) -> bool:
         if (
@@ -492,19 +573,27 @@ class EmailPPAdapter(BasePlatformAdapter):
         context = self._router.context_for(route) or {}
         delivery = context.get("delivery_context", {})
         quote_source = context.get("quote_source", {})
+        draft = context.get("draft_context", {})
         plain_body, html_body = self._response_bodies(route, content)
 
         subject = str(delivery.get("subject", "")).strip()
-        if not subject.lower().startswith("re:"):
+        fresh_draft = (
+            draft.get("is_forwarded") == "true" and draft.get("draft_sent") == "false"
+        )
+        if fresh_draft:
+            original_subject = str(draft.get("original_subject", "")).strip()
+            subject = f"Draft: Re: {original_subject or 'Hermes Agent'}"
+        elif not subject.lower().startswith("re:"):
             subject = f"Re: {subject}" if subject else "Re: Hermes Agent"
         recipient_name = str(delivery.get("display_name", ""))
         message = EmailMessage(policy=SMTP)
         message["From"] = Address(display_name="Hermes Agent", addr_spec=self._address)
         message["To"] = Address(display_name=recipient_name, addr_spec=route.chat_id)
         message["Subject"] = subject
-        message["In-Reply-To"] = reply_ids[0]
-        references = _message_ids(str(quote_source.get("references", "")))
-        message["References"] = " ".join(dict.fromkeys([*references, reply_ids[0]]))
+        if not fresh_draft:
+            message["In-Reply-To"] = reply_ids[0]
+            references = _message_ids(str(quote_source.get("references", "")))
+            message["References"] = " ".join(dict.fromkeys([*references, reply_ids[0]]))
         message["Date"] = formatdate(localtime=True)
         message_id = f"<hermes-{uuid.uuid4().hex}@{self._address.rsplit('@', 1)[-1]}>"
         message["Message-ID"] = message_id
@@ -529,4 +618,6 @@ class EmailPPAdapter(BasePlatformAdapter):
             smtp.send_message(message)
         finally:
             smtp.quit()
+        if fresh_draft:
+            self._router.update_context(route, draft_context={"draft_sent": "true"})
         return message_id
