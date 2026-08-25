@@ -168,3 +168,25 @@ $ uv build --out-dir dist --clear
 The release smoke test installs the built wheel with a supported Hermes Agent
 0.19 release, then confirms the `email-pp` entry point loads without replacing
 the built-in `email` registration.
+
+## Releases
+
+1. Update `[project].version` in `pyproject.toml` and add the matching version
+   section to `CHANGELOG.md`.
+2. Commit and merge the release changes, then create and push a tag matching
+   `vX.Y.Z`. The tag must equal `v` followed by `[project].version`, for example
+   package version `0.2.0` requires tag `v0.2.0`.
+3. The Release workflow runs the full validation suite, builds the wheel and
+   source distribution, publishes those exact artifacts to PyPI, and creates a
+   GitHub Release with generated notes and the same artifacts. A failure at any
+   stage prevents later stages from running.
+
+The workflow has a manual `workflow_dispatch` tag input solely to bootstrap an
+existing tag, such as `v0.1.0`; it applies the same tag and version validation.
+
+Before the first release, create a protected GitHub Actions environment named
+`pypi` and configure PyPI Trusted Publishing for project `hermes-email-pp` with
+GitHub owner `JNevrly`, repository `hermes_email_pp`, workflow
+`.github/workflows/release.yml` (workflow filename `release.yml`), and
+environment `pypi`. PyPI supports creating this as a pending publisher before
+the project exists. No PyPI API token or repository secret is needed.
