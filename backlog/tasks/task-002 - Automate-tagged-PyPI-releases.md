@@ -5,7 +5,7 @@ status: In Progress
 assignee:
   - '@opencode'
 created_date: '2026-08-25 10:53'
-updated_date: '2026-08-25 10:56'
+updated_date: '2026-08-25 11:13'
 labels: []
 dependencies: []
 references:
@@ -16,6 +16,10 @@ documentation:
 modified_files:
   - .github/workflows/release.yml
   - README.md
+  - hermes_email_pp/threading.py
+  - pyproject.toml
+  - uv.lock
+  - CHANGELOG.md
 priority: high
 type: feature
 ordinal: 8000
@@ -46,14 +50,22 @@ Create a GitHub Actions release pipeline that validates and publishes the packag
 3. Publish the verified artifacts through PyPI Trusted Publishing, then create a generated-notes GitHub Release with those artifacts.
 4. Document the release procedure and one-time PyPI/GitHub setup.
 5. Validate the workflow syntax and run the release checks locally.
+
+6. Bump the unreleased package and changelog version to 0.1.1 so the first public artifact corresponds to a new immutable v0.1.1 tag.
 <!-- SECTION:PLAN:END -->
 
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-Added .github/workflows/release.yml with isolated build, PyPI Trusted Publishing, and GitHub Release jobs. The workflow validates stable tags against pyproject.toml, supports manual existing-tag dispatch, passes distributions through an artifact, and attaches them only after publication succeeds. README now documents the release process and required pending Trusted Publisher configuration.
+Release workflow: .github/workflows/release.yml isolates build/test, PyPI Trusted Publishing, and GitHub Release creation. It validates stable tags against pyproject.toml, uses an artifact to publish and attach the exact same files, and generates GitHub release notes.
 
-Local validation passed: actionlint 1.7.12 accepted .github/workflows/release.yml; the tag guard accepted v0.1.0 and rejected malformed and mismatched versions; Ruff, format check, MyPy, 27 Pytest tests at 100% coverage, uv build, and twine metadata checks passed. An isolated Python 3.13 environment installed the wheel with Hermes Agent 0.19.0 and loaded the email-pp entry point. Remote PyPI publication and GitHub Release creation remain pending the maintainer's GitHub environment and PyPI pending Trusted Publisher configuration, then manual dispatch for v0.1.0.
+CI fix: hermes_constants is optional but GitHub's clean environment exposes it as an installed untyped module. The import suppresses both import-not-found and import-untyped; its line-local Ruff I001 suppression keeps the MyPy-required statement-level ignore.
+
+Release target: preserve the existing unpublished v0.1.0 tag. The first public release is 0.1.1/v0.1.1; pyproject.toml and uv.lock were bumped, the changelog records the first PyPI release, and the README no longer suggests bootstrapping v0.1.0.
+
+Verification: actionlint 1.7.12 accepted the workflow. Ruff, format check, clean MyPy (--no-incremental), 27 Pytest tests at 100% coverage, uv lock --check, uv build, and twine metadata validation pass. An isolated Python 3.13 environment installed the 0.1.1 wheel with Hermes Agent 0.19.0 and loaded the email-pp entry point.
+
+Remote verification remains: merge the fix, push v0.1.1, and confirm the workflow publishes to PyPI and creates the GitHub Release.
 <!-- SECTION:NOTES:END -->
 
 ## Comments
@@ -63,5 +75,17 @@ author: Human
 created: 2026-08-25 10:56
 ---
 Human: Use PyPI Trusted Publishing, GitHub-generated release notes, and a manual existing-tag bootstrap for v0.1.0.
+---
+
+author: Human
+created: 2026-08-25 11:10
+---
+Human: The manually dispatched v0.1.0 Release workflow failed in Run quality checks because MyPy reported hermes_constants as installed but untyped (import-untyped).
+---
+
+author: Human
+created: 2026-08-25 11:13
+---
+Human: Preserve the existing v0.1.0 tag and make the first publication a new v0.1.1 release.
 ---
 <!-- COMMENTS:END -->

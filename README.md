@@ -181,8 +181,8 @@ the built-in `email` registration.
    GitHub Release with generated notes and the same artifacts. A failure at any
    stage prevents later stages from running.
 
-The workflow has a manual `workflow_dispatch` tag input solely to bootstrap an
-existing tag, such as `v0.1.0`; it applies the same tag and version validation.
+The workflow has a manual `workflow_dispatch` tag input for recovering a valid
+existing tag; it applies the same tag and version validation.
 
 Before the first release, create a protected GitHub Actions environment named
 `pypi` and configure PyPI Trusted Publishing for project `hermes-email-pp` with

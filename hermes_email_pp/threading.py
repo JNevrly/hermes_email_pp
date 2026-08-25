@@ -33,7 +33,7 @@ class ThreadRoute:
 def active_profile_home() -> Path:
     """Resolve Hermes' active profile directory without an eager dependency."""
     try:
-        from hermes_constants import get_hermes_home  # type: ignore[import-not-found]
+        from hermes_constants import get_hermes_home  # type: ignore[import-not-found,import-untyped]  # noqa: I001
     except ImportError:
         return Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser()
     return get_hermes_home()
