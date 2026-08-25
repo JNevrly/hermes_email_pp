@@ -5,7 +5,7 @@ status: In Progress
 assignee:
   - '@opencode'
 created_date: '2026-08-25 10:53'
-updated_date: '2026-08-25 11:13'
+updated_date: '2026-08-25 11:21'
 labels: []
 dependencies: []
 references:
@@ -52,6 +52,8 @@ Create a GitHub Actions release pipeline that validates and publishes the packag
 5. Validate the workflow syntax and run the release checks locally.
 
 6. Bump the unreleased package and changelog version to 0.1.1 so the first public artifact corresponds to a new immutable v0.1.1 tag.
+
+7. Check out the verified tag in the GitHub Release job and add a documented manual recovery input that skips PyPI only after a version has already been published.
 <!-- SECTION:PLAN:END -->
 
 ## Implementation Notes
@@ -66,6 +68,8 @@ Release target: preserve the existing unpublished v0.1.0 tag. The first public r
 Verification: actionlint 1.7.12 accepted the workflow. Ruff, format check, clean MyPy (--no-incremental), 27 Pytest tests at 100% coverage, uv lock --check, uv build, and twine metadata validation pass. An isolated Python 3.13 environment installed the 0.1.1 wheel with Hermes Agent 0.19.0 and loaded the email-pp entry point.
 
 Remote verification remains: merge the fix, push v0.1.1, and confirm the workflow publishes to PyPI and creates the GitHub Release.
+
+Release recovery fix: the GitHub Release job now checks out needs.build.outputs.tag before gh release create --verify-tag. workflow_dispatch also has a required skip_pypi boolean (default false); it skips only the upload step so an already-published version can complete its missing GitHub Release. README documents this narrow recovery use. actionlint accepts the updated workflow.
 <!-- SECTION:NOTES:END -->
 
 ## Comments
@@ -87,5 +91,11 @@ author: Human
 created: 2026-08-25 11:13
 ---
 Human: Preserve the existing v0.1.0 tag and make the first publication a new v0.1.1 release.
+---
+
+author: Human
+created: 2026-08-25 11:21
+---
+Human: v0.1.1 validation and PyPI publishing succeeded, but GitHub Release creation failed because the artifact-only job had no .git directory for gh release create --verify-tag.
 ---
 <!-- COMMENTS:END -->

@@ -182,7 +182,10 @@ the built-in `email` registration.
    stage prevents later stages from running.
 
 The workflow has a manual `workflow_dispatch` tag input for recovering a valid
-existing tag; it applies the same tag and version validation.
+existing tag; it applies the same tag and version validation. Leave `skip_pypi`
+disabled unless the exact version is already on PyPI. That recovery option lets
+the workflow create a missing GitHub Release without attempting a duplicate
+PyPI upload.
 
 Before the first release, create a protected GitHub Actions environment named
 `pypi` and configure PyPI Trusted Publishing for project `hermes-email-pp` with

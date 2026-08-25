@@ -10,6 +10,11 @@ on:
         description: Existing vX.Y.Z tag to release
         required: true
         type: string
+      skip_pypi:
+        description: Skip PyPI only when this version is already published
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -111,6 +116,7 @@ jobs:
           path: dist/
 
       - name: Publish package distributions to PyPI
+        if: ${{ !inputs.skip_pypi }}
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/
@@ -124,6 +130,11 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Check out release tag
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.build.outputs.tag }}
+
       - name: Download release distributions
         uses: actions/download-artifact@v4
         with:
