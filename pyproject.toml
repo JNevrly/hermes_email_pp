@@ -1,6 +1,6 @@
 [project]
 name = "hermes-email-pp"
-version = "0.2.2"
+version = "0.2.3"
 description = "Better email adapter for Hermes Agent."
 authors = [
     { name = "Josef Nevrly", email = "josef.nevrly@gmail.com" }

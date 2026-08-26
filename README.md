@@ -182,12 +182,15 @@ built-in `email` registration.
 
 ## Releases
 
-1. Update `[project].version` in `pyproject.toml` and add the matching version
-   section to `CHANGELOG.md`.
-2. Commit and merge the release changes, then create and push a tag matching
+1. Update the version in `pyproject.toml`, `plugin.yaml`, and
+   `hermes_email_pp/__init__.py`, then add the matching version section to
+   `CHANGELOG.md`.
+2. Regenerate the lockfile with `uv lock`. Before tagging, verify it with
+   `uv lock --check` and `uv sync --group dev --locked`.
+3. Commit and merge the release changes, then create and push a tag matching
    `vX.Y.Z`. The tag must equal `v` followed by `[project].version`, for example
    package version `0.2.0` requires tag `v0.2.0`.
-3. The Release workflow runs the full validation suite, builds the wheel and
+4. The Release workflow runs the full validation suite, builds the wheel and
    source distribution, publishes those exact artifacts to PyPI, and creates a
    GitHub Release with generated notes and the same artifacts. A failure at any
    stage prevents later stages from running.

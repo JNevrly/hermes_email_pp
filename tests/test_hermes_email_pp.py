@@ -15,6 +15,7 @@ import yaml
 
 import hermes_email_pp
 from hermes_email_pp import config as email_config
+from hermes_email_pp import plugin as email_plugin
 from hermes_email_pp import threading as email_threading
 from hermes_email_pp.config import (
     CHANNEL_ENV,
@@ -36,8 +37,13 @@ class RecordingContext:
 
 def test_project_declares_email_pp_entry_point() -> None:
     project = tomllib.loads(Path("pyproject.toml").read_text())
+    lock = tomllib.loads(Path("uv.lock").read_text())
+    locked_project = next(
+        package for package in lock["package"] if package["name"] == "hermes-email-pp"
+    )
 
     assert project["project"]["version"] == hermes_email_pp.__version__
+    assert locked_project["version"] == hermes_email_pp.__version__
     assert project["project"]["entry-points"]["hermes_agent.plugins"] == {
         "email-pp": "hermes_email_pp.plugin"
     }
@@ -150,6 +156,18 @@ def test_registers_email_pp_with_isolated_access_control() -> None:
     assert context.registration["required_env"] == list(CHANNEL_REQUIRED_ENV)
     assert context.registration["allowed_users_env"] == "EMAIL_PP_ALLOWED_USERS"
     assert context.registration["allow_all_env"] == "EMAIL_PP_ALLOW_ALL_USERS"
+
+
+def test_registers_without_vanilla_channel_metadata(monkeypatch) -> None:
+    def missing_hermes_config(*args: object, **kwargs: object) -> ModuleType:
+        raise ImportError
+
+    monkeypatch.setattr(email_plugin, "import_module", missing_hermes_config)
+    context = RecordingContext()
+
+    register(context)
+
+    assert context.registration["name"] == "email_pp"
 
 
 def test_registers_all_channel_metadata_with_vanilla_hermes(monkeypatch) -> None:
