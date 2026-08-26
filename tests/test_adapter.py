@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from pathlib import Path
@@ -221,6 +222,37 @@ def test_tls_baseline_fetch_and_reconnect(adapter, monkeypatch) -> None:
             raise OSError("also broken")
 
     adapter._close_imap(BrokenIMAP())
+
+
+def test_imap_poll_logs_only_fetch_attempts(adapter, monkeypatch, caplog) -> None:
+    imap = IMAP()
+    monkeypatch.setattr(
+        adapter_module.imaplib, "IMAP4_SSL", lambda *args, **kwargs: imap
+    )
+    caplog.set_level(logging.INFO, logger=adapter_module.__name__)
+    adapter._baseline_mailbox(False)
+
+    caplog.clear()
+    imap.responses["UNSEEN"] = ("OK", [b""])
+    assert adapter._fetch_unseen() == []
+    assert "completed poll batch" not in caplog.text
+
+    caplog.clear()
+    imap.responses["UNSEEN"] = ("OK", [b"3"])
+    imap.responses["fetch"] = ("NO", [])
+    assert adapter._fetch_unseen() == []
+    assert "completed poll batch (fetched=0, attempted=1)" in caplog.text
+
+    caplog.clear()
+    imap.responses["fetch"] = (
+        "OK",
+        [
+            (b"3 (RFC822 {32}", b"From: person@example.com\n\nhello"),
+            b' INTERNALDATE "26-Aug-2026 12:00:00 +0000")',
+        ],
+    )
+    assert adapter._fetch_unseen() == [b"From: person@example.com\n\nhello"]
+    assert "completed poll batch (fetched=1, attempted=1)" in caplog.text
 
 
 def test_cold_start_history_modes_batches_and_uidvalidity(adapter, monkeypatch) -> None:

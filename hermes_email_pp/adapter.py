@@ -420,11 +420,12 @@ class EmailPPAdapter(BasePlatformAdapter):
                 messages.append(raw)
             self._trim_seen()
             self._save_mailbox_state()
-            logger.info(
-                "Email++ IMAP completed poll batch (fetched=%d, attempted=%d)",
-                len(messages),
-                attempts,
-            )
+            if attempts:
+                logger.info(
+                    "Email++ IMAP completed poll batch (fetched=%d, attempted=%d)",
+                    len(messages),
+                    attempts,
+                )
             return messages
         finally:
             self._close_imap(imap)
