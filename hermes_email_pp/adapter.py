@@ -441,15 +441,30 @@ class EmailPPAdapter(BasePlatformAdapter):
         if status != "OK" or not isinstance(data, (list, tuple)) or not data:
             logger.warning("Email++ IMAP message fetch failed")
             return None
-        try:
-            descriptor, raw = data[0]
-        except (IndexError, TypeError, ValueError):
-            logger.warning("Email++ IMAP returned malformed message fetch response")
-            return None
-        if not isinstance(descriptor, bytes) or not isinstance(raw, bytes):
+        raw: bytes | None = None
+        metadata: list[bytes] = []
+        for index, item in enumerate(data):
+            if not isinstance(item, tuple) or len(item) != 2:
+                continue
+            descriptor, literal = item
+            if (
+                not isinstance(descriptor, bytes)
+                or not isinstance(literal, bytes)
+                or b"RFC822" not in descriptor
+            ):
+                continue
+            raw = literal
+            metadata.append(descriptor)
+            # imaplib appends protocol attributes after an RFC822 literal.
+            # Only inspect those attributes, never bytes from the message body.
+            metadata.extend(
+                item for item in data[index + 1 :] if isinstance(item, bytes)
+            )
+            break
+        if raw is None:
             logger.warning("Email++ IMAP returned malformed message fetch data")
             return None
-        match = _INTERNALDATE.search(descriptor)
+        match = _INTERNALDATE.search(b" ".join(metadata))
         if match is None:
             return raw, None
         try:

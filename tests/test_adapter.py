@@ -77,9 +77,10 @@ class IMAP:
                 "OK",
                 [
                     (
-                        b'3 (RFC822 {32} INTERNALDATE "26-Aug-2026 12:00:00 +0000")',
+                        b"3 (RFC822 {32}",
                         b"From: person@example.com\n\nhello",
-                    )
+                    ),
+                    b' INTERNALDATE "26-Aug-2026 12:00:00 +0000")',
                 ],
             ),
         }
@@ -231,9 +232,10 @@ def test_cold_start_history_modes_batches_and_uidvalidity(adapter, monkeypatch) 
         "OK",
         [
             (
-                b'1 (INTERNALDATE "26-Aug-2026 12:00:00 +0000")',
+                b"1 (RFC822 {32}",
                 b"From: person@example.com\n\nhello",
-            )
+            ),
+            b' INTERNALDATE "26-Aug-2026 12:00:00 +0000")',
         ],
     )
     monkeypatch.setattr(
@@ -259,9 +261,10 @@ def test_cold_start_history_modes_batches_and_uidvalidity(adapter, monkeypatch) 
         "OK",
         [
             (
-                f'1 (INTERNALDATE "{recent_internaldate}")'.encode(),
+                b"1 (RFC822 {32}",
                 b"From: person@example.com\n\nhello",
-            )
+            ),
+            f' INTERNALDATE "{recent_internaldate}")'.encode(),
         ],
     )
     assert len(adapter._fetch_unseen()) == 3
@@ -313,7 +316,11 @@ def test_imap_polling_rejects_malformed_responses_and_bounds_work(
     adapter._seen.clear()
     adapter._process_history_window = 60
     adapter._baseline_uid = 1
-    imap.responses["fetch"] = ("OK", [(b"1 (RFC822 {4})", b"body")])
+    raw_with_fake_metadata = b'body INTERNALDATE "26-Aug-2026 12:00:00 +0000"'
+    imap.responses["fetch"] = (
+        "OK",
+        [(b"1 (RFC822 {4}", raw_with_fake_metadata), b")"],
+    )
     assert adapter._fetch_unseen() == []
 
     class EmptyResponse(IMAP):
@@ -324,21 +331,38 @@ def test_imap_polling_rejects_malformed_responses_and_bounds_work(
     imap.responses["UNSEEN"] = ("OK", [1])
     with pytest.raises(adapter_module.imaplib.IMAP4.error, match="malformed"):
         adapter._fetch_unseen()
-    assert adapter_module.EmailPPAdapter._fetch_message(imap, b"1") is not None
+    assert adapter_module.EmailPPAdapter._fetch_message(imap, b"1") == (
+        raw_with_fake_metadata,
+        None,
+    )
     imap.responses["fetch"] = ("OK", [()])
     assert adapter_module.EmailPPAdapter._fetch_message(imap, b"1") is None
     imap.responses["fetch"] = ("OK", [(b"x", b"body")])
-    assert adapter_module.EmailPPAdapter._fetch_message(imap, b"1") == (b"body", None)
+    assert adapter_module.EmailPPAdapter._fetch_message(imap, b"1") is None
     imap.responses["fetch"] = ("OK", [(None, b"body")])
     assert adapter_module.EmailPPAdapter._fetch_message(imap, b"1") is None
     imap.responses["fetch"] = (
         "OK",
-        [(b'1 (INTERNALDATE "invalid")', b"body")],
+        [(b"1 (RFC822 {4}", b"body"), b' INTERNALDATE "invalid")'],
     )
     assert adapter_module.EmailPPAdapter._fetch_message(imap, b"1") == (b"body", None)
     imap.responses["fetch"] = (
         "OK",
-        [(b'1 (INTERNALDATE "26-Aug-2026 12:00:00")', b"body")],
+        [
+            (b"1 (RFC822 {4}", b"body"),
+            b' INTERNALDATE "26-Aug-2026 12:00:00 +0000")',
+        ],
+    )
+    assert adapter_module.EmailPPAdapter._fetch_message(imap, b"1") == (
+        b"body",
+        datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc),
+    )
+    imap.responses["fetch"] = (
+        "OK",
+        [
+            (b"1 (RFC822 {4}", b"body"),
+            b' INTERNALDATE "26-Aug-2026 12:00:00")',
+        ],
     )
     monkeypatch.setattr(
         adapter_module,

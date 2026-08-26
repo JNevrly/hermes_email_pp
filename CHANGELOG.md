@@ -1,5 +1,9 @@
 # History
 
+## 0.3.1 (2026-08-26)
+
+* Parse IMAP INTERNALDATE metadata returned after an RFC822 message literal.
+
 ## 0.3.0 (2026-08-26)
 
 * Fix IMAP polling charset handling and add controlled unread-history recovery.
