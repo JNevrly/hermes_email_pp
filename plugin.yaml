@@ -1,7 +1,7 @@
 name: email-pp
 label: Email++
 kind: platform
-version: 0.2.0
+version: 0.2.1
 description: IMAP and SMTP gateway adapter with per-thread email routing.
 author: Josef Nevrly
 requires_env:

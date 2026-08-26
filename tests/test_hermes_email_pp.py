@@ -13,6 +13,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import yaml
 
+import hermes_email_pp
 from hermes_email_pp import config as email_config
 from hermes_email_pp import threading as email_threading
 from hermes_email_pp.config import (
@@ -35,6 +36,7 @@ class RecordingContext:
 def test_project_declares_email_pp_entry_point() -> None:
     project = tomllib.loads(Path("pyproject.toml").read_text())
 
+    assert project["project"]["version"] == hermes_email_pp.__version__
     assert project["project"]["entry-points"]["hermes_agent.plugins"] == {
         "email-pp": "hermes_email_pp.plugin"
     }
@@ -47,6 +49,7 @@ def test_root_directory_plugin_manifest_and_loader() -> None:
     manifest = yaml.safe_load((root / "plugin.yaml").read_text())
     assert manifest["name"] == "email-pp"
     assert manifest["kind"] == "platform"
+    assert manifest["version"] == hermes_email_pp.__version__
     assert "EMAIL_PP_PASSWORD" in {
         item["name"] if isinstance(item, dict) else item
         for item in manifest["requires_env"]
