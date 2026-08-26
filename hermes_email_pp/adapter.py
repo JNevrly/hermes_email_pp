@@ -5,16 +5,19 @@ from __future__ import annotations
 import asyncio
 import email
 import imaplib
+import logging
 import mimetypes
 import re
 import smtplib
 import ssl
 import uuid
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from email.header import decode_header
 from email.headerregistry import Address
 from email.message import EmailMessage
 from email.policy import SMTP
-from email.utils import formatdate, parseaddr
+from email.utils import formatdate, parseaddr, parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
@@ -31,7 +34,7 @@ from gateway.platforms.base import (  # type: ignore[import-not-found]
     validate_inbound_media_size,
 )
 
-from .config import environment_settings
+from .config import environment_settings, process_history_window
 from .forwarding import (
     ForwardedMessage,
     hermes_prompt,
@@ -46,6 +49,18 @@ _AUTOMATED = ("noreply", "no-reply", "mailer-daemon", "postmaster", "bounce")
 _IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 _MESSAGE_ID = re.compile(r"<[^\s<>@]+@[^\s<>@]+>")
 _MESSAGE_IDS = re.compile(r"<[^\s<>@]+@[^\s<>@]+>(?:\s+<[^\s<>@]+@[^\s<>@]+>)*")
+_INTERNALDATE = re.compile(rb'INTERNALDATE "([^"]+)"')
+_POLL_BATCH_SIZE = 25
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _MailboxState:
+    """State retained across automatic reconnects in one gateway process."""
+
+    uidvalidity: bytes | None
+    baseline_uid: int
+    seen: set[bytes]
 
 
 def _decode(value: str) -> str:
@@ -85,7 +100,7 @@ def _display_name(value: str) -> str:
 class EmailPPAdapter(BasePlatformAdapter):
     """Poll a TLS mailbox and deliver only explicitly routed email replies."""
 
-    _seen_by_address: dict[str, set[bytes]] = {}
+    _mailbox_states: dict[tuple[str, str], _MailboxState] = {}
 
     def __init__(self, config: Any) -> None:
         super().__init__(config, Platform("email_pp"))
@@ -135,7 +150,20 @@ class EmailPPAdapter(BasePlatformAdapter):
             settings, extra, "EMAIL_PP_AUTHSERV_ID", "authserv_id"
         )
         self._quote_mode = self._parse_quote_mode(settings, extra)
+        self._process_history_window = process_history_window(
+            self._setting(
+                settings,
+                extra,
+                "EMAIL_PP_PROCESS_HISTORY_WINDOW",
+                "process_history_window",
+            )
+        )
         self._seen: set[bytes] = set()
+        self._baseline_uid = 0
+        self._uidvalidity: bytes | None = None
+        self._history_cutoff = datetime.now(timezone.utc) - timedelta(
+            seconds=max(0, self._process_history_window)
+        )
         self._poll_task: asyncio.Task[None] | None = None
         self._routes: dict[tuple[str, str], ThreadRoute] = {}
         self._router = EmailThreadRouter()
@@ -169,8 +197,12 @@ class EmailPPAdapter(BasePlatformAdapter):
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Validate both TLS transports and begin asynchronous mailbox polling."""
         if not all((self._address, self._password, self._imap_host, self._smtp_host)):
+            logger.warning(
+                "Email++ connection rejected because required settings are missing"
+            )
             return False
         try:
+            logger.info("Email++ IMAP connection starting")
             if not self._acquire_platform_lock(
                 "email_pp", self._address, "Email++ mailbox"
             ):
@@ -178,10 +210,12 @@ class EmailPPAdapter(BasePlatformAdapter):
             await asyncio.to_thread(self._baseline_mailbox, is_reconnect)
             await asyncio.to_thread(self._probe_smtp)
         except (OSError, imaplib.IMAP4.error, smtplib.SMTPException):
+            logger.warning("Email++ connection validation failed")
             self._release_platform_lock()
             return False
         self._mark_connected()
         self._poll_task = asyncio.create_task(self._poll_loop())
+        logger.info("Email++ IMAP polling started")
         return True
 
     async def disconnect(self) -> None:
@@ -196,21 +230,99 @@ class EmailPPAdapter(BasePlatformAdapter):
             self._poll_task = None
         self._release_platform_lock()
         self._mark_disconnected()
+        logger.info("Email++ IMAP polling stopped")
 
     def _baseline_mailbox(self, is_reconnect: bool) -> None:
         imap = imaplib.IMAP4_SSL(self._imap_host, self._imap_port, timeout=30)
         try:
             imap.login(self._address, self._password)
-            imap.select(self._mailbox)
-            if is_reconnect and self._address in self._seen_by_address:
-                self._seen = set(self._seen_by_address[self._address])
+            uidvalidity = self._select_mailbox(imap)
+            cached = self._mailbox_states.get(self._mailbox_key)
+            if (
+                is_reconnect
+                and cached is not None
+                and cached.uidvalidity == uidvalidity
+            ):
+                self._restore_mailbox_state(cached)
+                logger.info("Email++ IMAP reconnect restored mailbox state")
                 return
-            status, data = imap.uid("search", "", "ALL")
-            self._seen = set(data[0].split()) if status == "OK" and data else set()
-            self._trim_seen()
+            if is_reconnect and cached is not None:
+                logger.warning(
+                    "Email++ IMAP UIDVALIDITY changed; applying cold-start recovery"
+                )
+            self._start_cold_mailbox(imap, uidvalidity)
         finally:
             self._close_imap(imap)
-        self._seen_by_address[self._address] = set(self._seen)
+
+    @property
+    def _mailbox_key(self) -> tuple[str, str]:
+        return (self._address.lower(), self._mailbox)
+
+    def _restore_mailbox_state(self, state: _MailboxState) -> None:
+        self._uidvalidity = state.uidvalidity
+        self._baseline_uid = state.baseline_uid
+        self._seen = set(state.seen)
+
+    def _save_mailbox_state(self) -> None:
+        self._mailbox_states[self._mailbox_key] = _MailboxState(
+            self._uidvalidity, self._baseline_uid, set(self._seen)
+        )
+
+    def _start_cold_mailbox(
+        self, imap: imaplib.IMAP4, uidvalidity: bytes | None
+    ) -> None:
+        all_uids = self._search_uids(imap, "ALL")
+        valid_uids = [
+            value for uid in all_uids if (value := self._uid_number(uid)) is not None
+        ]
+        self._uidvalidity = uidvalidity
+        self._baseline_uid = max(valid_uids, default=0)
+        self._seen = set()
+        self._history_cutoff = datetime.now(timezone.utc) - timedelta(
+            seconds=max(0, self._process_history_window)
+        )
+        self._save_mailbox_state()
+        logger.info(
+            "Email++ IMAP cold-start state recorded (history_window=%d)",
+            self._process_history_window,
+        )
+
+    @staticmethod
+    def _uid_number(uid: bytes) -> int | None:
+        try:
+            value = int(uid)
+        except ValueError:
+            logger.warning("Email++ IMAP ignored malformed UID response")
+            return None
+        return value if value >= 0 else None
+
+    def _select_mailbox(self, imap: imaplib.IMAP4) -> bytes | None:
+        status, _ = imap.select(self._mailbox)
+        if status != "OK":
+            logger.warning("Email++ IMAP mailbox selection failed")
+            raise imaplib.IMAP4.error("IMAP mailbox selection failed")
+        response = imap.response("UIDVALIDITY")
+        if not isinstance(response, tuple) or len(response) != 2:
+            logger.warning("Email++ IMAP returned malformed UIDVALIDITY response")
+            return None
+        _, values = response
+        if not values or not isinstance(values[0], bytes):
+            return None
+        return values[0]
+
+    @staticmethod
+    def _search_uids(imap: imaplib.IMAP4, criteria: str) -> list[bytes]:
+        status, data = imap.uid("search", None, criteria)  # type: ignore[arg-type]
+        if status != "OK":
+            logger.warning("Email++ IMAP UID search failed (criteria=%s)", criteria)
+            raise imaplib.IMAP4.error("IMAP UID search failed")
+        if not isinstance(data, (list, tuple)) or not data:
+            logger.warning("Email++ IMAP returned malformed UID search response")
+            raise imaplib.IMAP4.error("IMAP UID search returned malformed data")
+        if not isinstance(data[0], bytes):
+            logger.warning("Email++ IMAP returned malformed UID search data")
+            raise imaplib.IMAP4.error("IMAP UID search returned malformed data")
+        return data[0].split()
 
     @staticmethod
     def _close_imap(imap: imaplib.IMAP4) -> None:
@@ -243,15 +355,21 @@ class EmailPPAdapter(BasePlatformAdapter):
     async def _poll_loop(self) -> None:  # pragma: no cover
         while self._running:
             try:
-                for raw in await asyncio.to_thread(self._fetch_unseen):
+                messages = await asyncio.to_thread(self._fetch_unseen)
+                logger.debug("Email++ IMAP poll fetched batch_size=%d", len(messages))
+                for raw in messages:
                     try:
                         await self._dispatch(raw)
                     except Exception:
+                        logger.warning("Email++ IMAP message dispatch failed")
                         continue
             except asyncio.CancelledError:
                 raise
-            except Exception as error:
-                self._set_fatal_error("poll_failed", str(error), retryable=True)
+            except Exception:
+                logger.warning("Email++ IMAP polling failed")
+                self._set_fatal_error(
+                    "poll_failed", "IMAP polling failed", retryable=True
+                )
                 await self._notify_fatal_error()
                 return
             await asyncio.sleep(max(1, self._poll_interval))
@@ -261,28 +379,86 @@ class EmailPPAdapter(BasePlatformAdapter):
         messages: list[bytes] = []
         try:
             imap.login(self._address, self._password)
-            imap.select(self._mailbox)
-            status, data = imap.uid("search", "", "UNSEEN")
-            if status != "OK" or not data:
-                return messages
-            for uid in data[0].split():
+            uidvalidity = self._select_mailbox(imap)
+            if uidvalidity != self._uidvalidity:
+                logger.warning("Email++ IMAP UIDVALIDITY changed during polling")
+                self._start_cold_mailbox(imap, uidvalidity)
+            attempts = 0
+            for uid in sorted(
+                self._search_uids(imap, "UNSEEN"), key=self._uid_sort_key
+            ):
                 if uid in self._seen:
                     continue
-                status, data = imap.uid("fetch", uid, "(RFC822)")
-                if status != "OK" or not data:
+                uid_number = self._uid_number(uid)
+                if uid_number is None:
                     continue
-                try:
-                    raw = data[0][1]
-                except (IndexError, TypeError):
+                if (
+                    uid_number <= self._baseline_uid
+                    and self._process_history_window == 0
+                ):
                     continue
-                if isinstance(raw, bytes):
+                if attempts >= _POLL_BATCH_SIZE:
+                    break
+                attempts += 1
+                fetched = self._fetch_message(imap, uid)
+                if fetched is None:
+                    continue
+                raw, internaldate = fetched
+                if (
+                    uid_number <= self._baseline_uid
+                    and self._process_history_window > 0
+                    and (internaldate is None or internaldate <= self._history_cutoff)
+                ):
+                    if internaldate is None:
+                        logger.warning(
+                            "Email++ IMAP skipped unread history with malformed "
+                            "INTERNALDATE"
+                        )
                     self._seen.add(uid)
-                    messages.append(raw)
+                    continue
+                self._seen.add(uid)
+                messages.append(raw)
             self._trim_seen()
+            self._save_mailbox_state()
+            logger.info(
+                "Email++ IMAP completed poll batch (fetched=%d, attempted=%d)",
+                len(messages),
+                attempts,
+            )
             return messages
         finally:
             self._close_imap(imap)
-            self._seen_by_address[self._address] = set(self._seen)
+
+    @staticmethod
+    def _uid_sort_key(uid: bytes) -> int:
+        return int(uid) if uid.isdigit() else -1
+
+    @staticmethod
+    def _fetch_message(
+        imap: imaplib.IMAP4, uid: bytes
+    ) -> tuple[bytes, datetime | None] | None:
+        status, data = imap.uid("fetch", uid.decode("ascii"), "(RFC822 INTERNALDATE)")
+        if status != "OK" or not isinstance(data, (list, tuple)) or not data:
+            logger.warning("Email++ IMAP message fetch failed")
+            return None
+        try:
+            descriptor, raw = data[0]
+        except (IndexError, TypeError, ValueError):
+            logger.warning("Email++ IMAP returned malformed message fetch response")
+            return None
+        if not isinstance(descriptor, bytes) or not isinstance(raw, bytes):
+            logger.warning("Email++ IMAP returned malformed message fetch data")
+            return None
+        match = _INTERNALDATE.search(descriptor)
+        if match is None:
+            return raw, None
+        try:
+            internaldate = parsedate_to_datetime(match.group(1).decode("ascii"))
+        except (TypeError, ValueError, UnicodeDecodeError):
+            return raw, None
+        if internaldate.tzinfo is None:
+            return raw, None
+        return raw, internaldate.astimezone(timezone.utc)
 
     def _trim_seen(self) -> None:
         if len(self._seen) > 2000:
@@ -421,8 +597,12 @@ class EmailPPAdapter(BasePlatformAdapter):
             or sender == self._address.lower()
             or any(x in sender for x in _AUTOMATED)
         ):
+            logger.debug(
+                "Email++ rejected inbound message: invalid or automated sender"
+            )
             return False
         if not self._allow_all and sender not in self._allowed:
+            logger.debug("Email++ rejected inbound message: sender is not allowlisted")
             return False
         if self._allow_all or not self._require_auth:
             return True
@@ -435,6 +615,7 @@ class EmailPPAdapter(BasePlatformAdapter):
                 continue
             if re.search(r"\bdmarc\s*=\s*pass\b", normalized, re.I):
                 return True
+        logger.debug("Email++ rejected inbound message: sender authentication failed")
         return False
 
     def _content(self, message: Any) -> tuple[str, list[str], list[str], Any]:

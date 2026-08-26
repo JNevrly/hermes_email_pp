@@ -78,12 +78,20 @@ Email++ platform configuration.
 | `EMAIL_PP_REQUIRE_AUTHENTICATED_SENDER` | No | `true` | Require a passing DMARC result in `Authentication-Results` for allowlisted senders. |
 | `EMAIL_PP_AUTHSERV_ID` | No | empty | Optional authentication-service identifier that must prefix the trusted `Authentication-Results` header. |
 | `EMAIL_PP_QUOTE_MODE` | No | `always` | `always` quotes the source email, `forwarded` quotes only parsed forwards, and `never` omits visible quotes. |
+| `EMAIL_PP_PROCESS_HISTORY_WINDOW` | No | `0` | Unread mail recovery at a cold gateway start: `0` skips existing mail, `-1` processes all unread mail, and a positive exact-second window processes only unread mail newer than that cutoff. |
 
 `EMAIL_PP_ALLOW_ALL_USERS` accepts every non-automated sender and disables the
 allowlist and sender-authentication checks. Leave it disabled for an
 Internet-facing mailbox. The safer default,
 `EMAIL_PP_REQUIRE_AUTHENTICATED_SENDER=true`, remains enabled unless you
 explicitly turn it off.
+
+At a cold gateway start, Email++ normally ignores unread mail already present
+in the selected mailbox. Set `EMAIL_PP_PROCESS_HISTORY_WINDOW` to `-1` to
+recover all unread mail, or to a positive number of seconds to recover only
+recent unread mail. Invalid values and values below `-1` prevent the adapter
+from starting. Automatic reconnects in a running gateway retain their mailbox
+state and process unread mail received during the outage.
 
 ## Email Behavior
 

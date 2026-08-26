@@ -1,5 +1,9 @@
 # History
 
+## 0.3.0 (2026-08-26)
+
+* Fix IMAP polling charset handling and add controlled unread-history recovery.
+
 ## 0.2.3 (2026-08-26)
 
 * Synchronize the release lockfile so locked GitHub Actions builds can validate and publish the package.

@@ -1,7 +1,7 @@
 name: email-pp
 label: Email++
 kind: platform
-version: 0.2.3
+version: 0.3.0
 description: IMAP and SMTP gateway adapter with per-thread email routing.
 author: Josef Nevrly
 requires_env:
@@ -37,3 +37,5 @@ optional_env:
     description: Optional authentication service identifier for trusted Authentication-Results headers.
   - name: EMAIL_PP_QUOTE_MODE
     description: "Enter always, forwarded, or never. Default always."
+  - name: EMAIL_PP_PROCESS_HISTORY_WINDOW
+    description: "Unread cold-start recovery in seconds: 0 skips existing mail, -1 processes all, positive values process only recent mail. Default: 0."

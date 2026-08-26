@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from pathlib import Path
 from types import SimpleNamespace
@@ -67,19 +68,37 @@ class Router:
 class IMAP:
     def __init__(self, *args: object, **kwargs: object) -> None:
         self.logged_out = False
+        self.calls: list[tuple[str, tuple[object, ...]]] = []
+        self.uidvalidity = b"1"
         self.responses = {
             "ALL": ("OK", [b"1 2"]),
             "UNSEEN": ("OK", [b"3 4"]),
-            "fetch": ("OK", [(None, b"From: person@example.com\n\nhello")]),
+            "fetch": (
+                "OK",
+                [
+                    (
+                        b'3 (RFC822 {32} INTERNALDATE "26-Aug-2026 12:00:00 +0000")',
+                        b"From: person@example.com\n\nhello",
+                    )
+                ],
+            ),
         }
 
     def login(self, *args: object) -> None:
         return None
 
-    def select(self, mailbox: str) -> None:
+    def select(self, mailbox: str) -> tuple[str, list[bytes]]:
         assert mailbox == "INBOX"
+        return "OK", [b"4"]
+
+    def response(self, name: str) -> tuple[str, list[bytes]]:
+        assert name == "UIDVALIDITY"
+        return name, [self.uidvalidity]
 
     def uid(self, command: str, *args: object):
+        self.calls.append((command, args))
+        if command == "search" and args[0] == "":
+            return "OK", [b""]
         return self.responses[args[-1] if command == "search" else "fetch"]
 
     def logout(self) -> None:
@@ -117,6 +136,7 @@ def adapter(monkeypatch, tmp_path) -> EmailPPAdapter:
         "EMAIL_PP_IMAP_HOST",
         "EMAIL_PP_SMTP_HOST",
         "EMAIL_PP_QUOTE_MODE",
+        "EMAIL_PP_PROCESS_HISTORY_WINDOW",
     ):
         monkeypatch.delenv(name, raising=False)
     return EmailPPAdapter(
@@ -165,12 +185,17 @@ def test_tls_baseline_fetch_and_reconnect(adapter, monkeypatch) -> None:
 
     monkeypatch.setattr(adapter_module.imaplib, "IMAP4_SSL", build_imap)
     adapter._baseline_mailbox(False)
-    assert adapter._seen == {b"1", b"2"}
+    assert adapter._baseline_uid == 2
     assert instances[0].logged_out
+    assert instances[0].calls == [("search", (None, "ALL"))]
+    assert instances[0].uid("search", "", "UNSEEN") == ("OK", [b""])
     adapter._baseline_mailbox(True)
-    assert adapter._seen == {b"1", b"2"}
-    adapter._seen = {b"3"}
-    assert adapter._fetch_unseen() == [b"From: person@example.com\n\nhello"]
+    assert adapter._baseline_uid == 2
+    assert adapter._fetch_unseen() == [
+        b"From: person@example.com\n\nhello",
+        b"From: person@example.com\n\nhello",
+    ]
+    assert instances[-1].calls[0] == ("search", (None, "UNSEEN"))
     adapter._seen = {str(value).encode() for value in range(2001)}
     adapter._trim_seen()
     assert len(adapter._seen) == 1000
@@ -179,7 +204,8 @@ def test_tls_baseline_fetch_and_reconnect(adapter, monkeypatch) -> None:
     monkeypatch.setattr(
         adapter_module.imaplib, "IMAP4_SSL", lambda *args, **kwargs: no_messages
     )
-    assert adapter._fetch_unseen() == []
+    with pytest.raises(adapter_module.imaplib.IMAP4.error, match="search failed"):
+        adapter._fetch_unseen()
     no_messages.responses["UNSEEN"] = ("OK", [b"5"])
     no_messages.responses["fetch"] = ("NO", [])
     assert adapter._fetch_unseen() == []
@@ -194,6 +220,133 @@ def test_tls_baseline_fetch_and_reconnect(adapter, monkeypatch) -> None:
             raise OSError("also broken")
 
     adapter._close_imap(BrokenIMAP())
+
+
+def test_cold_start_history_modes_batches_and_uidvalidity(adapter, monkeypatch) -> None:
+    now = datetime.now(timezone.utc)
+    imap = IMAP()
+    imap.responses["ALL"] = ("OK", [b"1 2 3"])
+    imap.responses["UNSEEN"] = ("OK", [b"1 2 3"])
+    imap.responses["fetch"] = (
+        "OK",
+        [
+            (
+                b'1 (INTERNALDATE "26-Aug-2026 12:00:00 +0000")',
+                b"From: person@example.com\n\nhello",
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        adapter_module.imaplib, "IMAP4_SSL", lambda *args, **kwargs: imap
+    )
+
+    adapter._baseline_mailbox(False)
+    assert adapter._fetch_unseen() == []
+
+    adapter._process_history_window = -1
+    adapter._baseline_mailbox(False)
+    assert len(adapter._fetch_unseen()) == 3
+
+    adapter._seen.clear()
+    adapter._process_history_window = 60
+    adapter._history_cutoff = now - timedelta(seconds=60)
+    adapter._baseline_mailbox(False)
+    adapter._history_cutoff = now - timedelta(seconds=60)
+    recent_internaldate = (now - timedelta(seconds=59)).strftime(
+        "%d-%b-%Y %H:%M:%S +0000"
+    )
+    imap.responses["fetch"] = (
+        "OK",
+        [
+            (
+                f'1 (INTERNALDATE "{recent_internaldate}")'.encode(),
+                b"From: person@example.com\n\nhello",
+            )
+        ],
+    )
+    assert len(adapter._fetch_unseen()) == 3
+    imap.uidvalidity = b"2"
+    assert adapter._fetch_unseen() == 3 * [b"From: person@example.com\n\nhello"]
+
+
+def test_imap_polling_rejects_malformed_responses_and_bounds_work(
+    adapter, monkeypatch, caplog
+) -> None:
+    imap = IMAP()
+    monkeypatch.setattr(
+        adapter_module.imaplib, "IMAP4_SSL", lambda *args, **kwargs: imap
+    )
+    adapter._baseline_mailbox(False)
+    imap.uidvalidity = b"2"
+    adapter._baseline_mailbox(True)
+    assert adapter._uidvalidity == b"2"
+
+    imap.responses["UNSEEN"] = ("OK", b"bad")
+    with pytest.raises(adapter_module.imaplib.IMAP4.error, match="malformed"):
+        adapter._fetch_unseen()
+    imap.responses["UNSEEN"] = ("OK", [b"bad 1"])
+    assert adapter._fetch_unseen() == []
+
+    imap.responses["UNSEEN"] = (
+        "OK",
+        [b" ".join(str(value).encode() for value in range(1, 40))],
+    )
+    adapter._process_history_window = -1
+    adapter._seen.clear()
+    assert len(adapter._fetch_unseen()) == adapter_module._POLL_BATCH_SIZE
+
+    class BadSelect(IMAP):
+        def select(self, mailbox: str) -> tuple[str, list[bytes]]:
+            return "NO", []
+
+    with pytest.raises(adapter_module.imaplib.IMAP4.error, match="selection"):
+        adapter._select_mailbox(BadSelect())
+
+    class BadResponse(IMAP):
+        def response(self, name: str) -> object:
+            return None
+
+    assert adapter._select_mailbox(BadResponse()) is None
+    imap.responses["UNSEEN"] = ("OK", [b"1"])
+    adapter._seen = {b"1"}
+    assert adapter._fetch_unseen() == []
+    adapter._seen.clear()
+    adapter._process_history_window = 60
+    adapter._baseline_uid = 1
+    imap.responses["fetch"] = ("OK", [(b"1 (RFC822 {4})", b"body")])
+    assert adapter._fetch_unseen() == []
+
+    class EmptyResponse(IMAP):
+        def response(self, name: str) -> tuple[str, list[bytes]]:
+            return name, []
+
+    assert adapter._select_mailbox(EmptyResponse()) is None
+    imap.responses["UNSEEN"] = ("OK", [1])
+    with pytest.raises(adapter_module.imaplib.IMAP4.error, match="malformed"):
+        adapter._fetch_unseen()
+    assert adapter_module.EmailPPAdapter._fetch_message(imap, b"1") is not None
+    imap.responses["fetch"] = ("OK", [()])
+    assert adapter_module.EmailPPAdapter._fetch_message(imap, b"1") is None
+    imap.responses["fetch"] = ("OK", [(b"x", b"body")])
+    assert adapter_module.EmailPPAdapter._fetch_message(imap, b"1") == (b"body", None)
+    imap.responses["fetch"] = ("OK", [(None, b"body")])
+    assert adapter_module.EmailPPAdapter._fetch_message(imap, b"1") is None
+    imap.responses["fetch"] = (
+        "OK",
+        [(b'1 (INTERNALDATE "invalid")', b"body")],
+    )
+    assert adapter_module.EmailPPAdapter._fetch_message(imap, b"1") == (b"body", None)
+    imap.responses["fetch"] = (
+        "OK",
+        [(b'1 (INTERNALDATE "26-Aug-2026 12:00:00")', b"body")],
+    )
+    monkeypatch.setattr(
+        adapter_module,
+        "parsedate_to_datetime",
+        lambda value: datetime(2026, 8, 26, 12, 0, 0),
+    )
+    assert adapter_module.EmailPPAdapter._fetch_message(imap, b"1") == (b"body", None)
+    assert "secret" not in caplog.text and "Authentication-Results" not in caplog.text
 
 
 def test_smtp_tls_and_explicit_route_send(adapter, monkeypatch, tmp_path) -> None:

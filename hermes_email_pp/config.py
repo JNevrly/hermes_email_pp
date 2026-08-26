@@ -23,6 +23,7 @@ OPTIONAL_ENV = (
     "EMAIL_PP_REQUIRE_AUTHENTICATED_SENDER",
     "EMAIL_PP_AUTHSERV_ID",
     "EMAIL_PP_QUOTE_MODE",
+    "EMAIL_PP_PROCESS_HISTORY_WINDOW",
 )
 
 # Vanilla Hermes suppresses *_ALLOW_ALL_USERS optional fields from setup cards.
@@ -125,6 +126,16 @@ CHANNEL_ENV = (
         ),
         "advanced": True,
     },
+    {
+        "name": "EMAIL_PP_PROCESS_HISTORY_WINDOW",
+        "prompt": "Process unread history window (seconds)",
+        "description": (
+            "Process unread email already in the mailbox at startup. Enter 0 to "
+            "skip it, -1 to process all of it, or a positive number of seconds "
+            "to process only recent email. Default: 0."
+        ),
+        "advanced": True,
+    },
 )
 
 _CONFIG_KEYS = {
@@ -141,6 +152,7 @@ _CONFIG_KEYS = {
     "EMAIL_PP_REQUIRE_AUTHENTICATED_SENDER": "require_authenticated_sender",
     "EMAIL_PP_AUTHSERV_ID": "authserv_id",
     "EMAIL_PP_QUOTE_MODE": "quote_mode",
+    "EMAIL_PP_PROCESS_HISTORY_WINDOW": "process_history_window",
 }
 
 
@@ -171,16 +183,45 @@ def environment_settings(environ: Mapping[str, str] | None = None) -> dict[str, 
     }
 
 
+def process_history_window(value: object) -> int:
+    """Validate the optional unread cold-start recovery window."""
+    raw = str(value).strip()
+    if not raw:
+        return 0
+    try:
+        window = int(raw)
+    except ValueError as error:
+        raise ValueError(
+            "EMAIL_PP_PROCESS_HISTORY_WINDOW must be an integer greater than "
+            "or equal to -1"
+        ) from error
+    if window < -1:
+        raise ValueError(
+            "EMAIL_PP_PROCESS_HISTORY_WINDOW must be an integer greater than "
+            "or equal to -1"
+        )
+    return window
+
+
 def is_configured(config: Any, environ: Mapping[str, str] | None = None) -> bool:
     """Return whether isolated environment or platform config supplies all secrets."""
     extra = getattr(config, "extra", {})
     if not isinstance(extra, Mapping):
         return False
     settings = environment_settings(environ)
-    return all(
+    configured = all(
         settings.get(name) or str(extra.get(_CONFIG_KEYS[name], "")).strip()
         for name in REQUIRED_ENV
     )
+    if not configured:
+        return False
+    process_history_window(
+        settings.get(
+            "EMAIL_PP_PROCESS_HISTORY_WINDOW",
+            extra.get("process_history_window", ""),
+        )
+    )
+    return True
 
 
 def environment_enablement() -> dict[str, str] | None:

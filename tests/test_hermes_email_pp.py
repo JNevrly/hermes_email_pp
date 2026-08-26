@@ -23,6 +23,7 @@ from hermes_email_pp.config import (
     REQUIRED_ENV,
     environment_enablement,
     is_configured,
+    process_history_window,
 )
 from hermes_email_pp.plugin import check_requirements, create_adapter, register
 from hermes_email_pp.threading import EmailThreadRouter, ThreadRoute
@@ -260,6 +261,27 @@ def test_configuration_accepts_platform_extra_without_environment() -> None:
     )
 
     assert is_configured(config, environ={})
+
+
+def test_process_history_window_validation_and_environment_mapping(monkeypatch) -> None:
+    assert process_history_window("") == 0
+    assert process_history_window("0") == 0
+    assert process_history_window("-1") == -1
+    assert process_history_window("60") == 60
+    for value in ("no", "-2"):
+        with pytest.raises(ValueError, match="PROCESS_HISTORY_WINDOW"):
+            process_history_window(value)
+    for name, value in zip(
+        REQUIRED_ENV,
+        ("agent@example.com", "secret", "imap.example.com", "smtp.example.com"),
+        strict=True,
+    ):
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("EMAIL_PP_PROCESS_HISTORY_WINDOW", "60")
+    assert environment_enablement()["process_history_window"] == "60"
+    monkeypatch.setenv("EMAIL_PP_PROCESS_HISTORY_WINDOW", "invalid")
+    with pytest.raises(ValueError, match="PROCESS_HISTORY_WINDOW"):
+        is_configured(SimpleNamespace(extra={}))
 
 
 def test_scoped_configuration_never_falls_back_to_another_profile(monkeypatch) -> None:
