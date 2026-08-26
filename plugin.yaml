@@ -1,0 +1,29 @@
+name: email-pp
+label: Email++
+kind: platform
+version: 0.2.0
+description: IMAP and SMTP gateway adapter with per-thread email routing.
+author: Josef Nevrly
+requires_env:
+  - name: EMAIL_PP_ADDRESS
+    description: Agent mailbox address and SMTP envelope identity.
+    password: false
+  - name: EMAIL_PP_PASSWORD
+    description: IMAP and SMTP password or provider app password.
+    password: true
+  - name: EMAIL_PP_IMAP_HOST
+    description: IMAP server hostname.
+    password: false
+  - name: EMAIL_PP_SMTP_HOST
+    description: SMTP server hostname.
+    password: false
+optional_env:
+  - EMAIL_PP_IMAP_PORT
+  - EMAIL_PP_SMTP_PORT
+  - EMAIL_PP_POLL_INTERVAL
+  - EMAIL_PP_MAILBOX
+  - EMAIL_PP_ALLOWED_USERS
+  - EMAIL_PP_ALLOW_ALL_USERS
+  - EMAIL_PP_REQUIRE_AUTHENTICATED_SENDER
+  - EMAIL_PP_AUTHSERV_ID
+  - EMAIL_PP_QUOTE_MODE

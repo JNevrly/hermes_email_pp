@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import shutil
+import subprocess
 import sys
 import tomllib
+from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
+import yaml
 
+from hermes_email_pp import config as email_config
 from hermes_email_pp import threading as email_threading
 from hermes_email_pp.config import REQUIRED_ENV, environment_enablement, is_configured
 from hermes_email_pp.plugin import check_requirements, create_adapter, register
@@ -29,10 +34,90 @@ def test_project_declares_email_pp_entry_point() -> None:
         "email-pp": "hermes_email_pp.plugin"
     }
     assert project["project"]["requires-python"] == ">=3.11,<3.14"
-    assert project["project"]["dependencies"] == [
-        "hermes-agent>=0.19,<0.20",
-        "markdown>=3.10,<4.0",
-    ]
+    assert project["project"]["dependencies"] == ["markdown>=3.10,<4.0"]
+
+
+def test_root_directory_plugin_manifest_and_loader() -> None:
+    root = Path.cwd()
+    manifest = yaml.safe_load((root / "plugin.yaml").read_text())
+    assert manifest["name"] == "email-pp"
+    assert manifest["kind"] == "platform"
+    assert "EMAIL_PP_PASSWORD" in {
+        item["name"] if isinstance(item, dict) else item
+        for item in manifest["requires_env"]
+    }
+
+    module_name = "test_directory_email_pp"
+    spec = spec_from_file_location(
+        module_name,
+        root / "__init__.py",
+        submodule_search_locations=[str(root)],
+    )
+    assert spec is not None and spec.loader is not None
+    module = module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+        assert callable(module.register)
+    finally:
+        for name in list(sys.modules):
+            if name == module_name or name.startswith(f"{module_name}."):
+                sys.modules.pop(name, None)
+
+
+def test_repository_root_has_a_safe_hermes_plugin_scan() -> None:
+    plugin_guard = pytest.importorskip("tools.plugin_guard")
+
+    result = plugin_guard.scan_plugin(Path.cwd(), source="JNevrly/hermes_email_pp")
+
+    assert result.verdict == "safe"
+    assert not {finding.severity for finding in result.findings} & {"critical", "high"}
+
+
+def test_git_installer_accepts_the_directory_plugin(monkeypatch, tmp_path) -> None:
+    from hermes_cli.plugins_cmd import _install_plugin_core
+
+    source = tmp_path / "source"
+    shutil.copytree(
+        Path.cwd(),
+        source,
+        ignore=shutil.ignore_patterns(".git", ".venv", "dist", "__pycache__"),
+    )
+    subprocess.run(["git", "init", "--quiet", str(source)], check=True)
+    subprocess.run(["git", "-C", str(source), "add", "."], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(source),
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "--quiet",
+            "-m",
+            "test plugin",
+        ],
+        check=True,
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+
+    target, manifest, name = _install_plugin_core(f"file://{source}", force=False)
+
+    assert name == "email-pp"
+    assert manifest["kind"] == "platform"
+    assert (target / "__init__.py").is_file()
+    assert (target / "hermes_email_pp" / "plugin.py").is_file()
+
+
+def test_readme_documents_dashboard_installation_and_enablement() -> None:
+    readme = Path("README.md").read_text()
+
+    assert "Settings > Plugins > Install from Git" in readme
+    assert "JNevrly/hermes_email_pp" in readme
+    assert "enabled: [email-pp]" in readme
+    assert "Hermes Agent 0.20.5" in readme
 
 
 def test_registers_email_pp_with_isolated_access_control() -> None:
@@ -89,6 +174,51 @@ def test_configuration_accepts_platform_extra_without_environment() -> None:
     )
 
     assert is_configured(config, environ={})
+
+
+def test_scoped_configuration_never_falls_back_to_another_profile(monkeypatch) -> None:
+    from agent.secret_scope import (
+        reset_secret_scope,
+        set_multiplex_active,
+        set_secret_scope,
+    )
+
+    monkeypatch.setenv("EMAIL_PP_PASSWORD", "poisoned-default-profile-password")
+    set_multiplex_active(True)
+    token = set_secret_scope(
+        {
+            "EMAIL_PP_ADDRESS": "agent@example.com",
+            "EMAIL_PP_PASSWORD": "scoped-password",
+            "EMAIL_PP_IMAP_HOST": "imap.example.com",
+            "EMAIL_PP_SMTP_HOST": "smtp.example.com",
+        }
+    )
+    try:
+        assert environment_enablement()["password"] == "scoped-password"
+    finally:
+        reset_secret_scope(token)
+
+    token = set_secret_scope({})
+    try:
+        assert environment_enablement() is None
+    finally:
+        reset_secret_scope(token)
+        set_multiplex_active(False)
+
+
+def test_secret_fallbacks_remain_available_for_default_profile(monkeypatch) -> None:
+    monkeypatch.setenv("EMAIL_PP_ADDRESS", "default@example.com")
+    with monkeypatch.context() as isolated:
+        isolated.setitem(sys.modules, "agent.secret_scope", None)
+        assert email_config._secret("EMAIL_PP_ADDRESS") == "default@example.com"
+
+    from agent.secret_scope import set_multiplex_active
+
+    set_multiplex_active(True)
+    try:
+        assert email_config._secret("EMAIL_PP_ADDRESS") == "default@example.com"
+    finally:
+        set_multiplex_active(False)
 
 
 def test_configuration_rejects_non_mapping_platform_extra() -> None:

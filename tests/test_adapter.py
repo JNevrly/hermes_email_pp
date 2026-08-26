@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from gateway.platform_registry import PlatformEntry, platform_registry
 
 from hermes_email_pp import adapter as adapter_module
 from hermes_email_pp.adapter import (
@@ -24,6 +25,19 @@ from hermes_email_pp.forwarding import (
     parse_forward,
 )
 from hermes_email_pp.rendering import _SafeHTML
+
+
+@pytest.fixture(autouse=True)
+def registered_email_pp_platform() -> None:
+    """Make the dynamic Platform enum available before constructing adapters."""
+    platform_registry.register(
+        PlatformEntry(
+            name="email_pp",
+            label="Email++",
+            adapter_factory=lambda config: config,
+            check_fn=lambda: True,
+        )
+    )
 
 
 class Router:
@@ -127,6 +141,11 @@ def test_header_helpers_are_safe() -> None:
         "<two@example.com>",
     ]
     assert _message_ids("<one@example.com>\nBcc: attacker@example.com") == []
+
+
+def test_platform_extra_accepts_an_allowed_user_list(adapter) -> None:
+    extra = {"allowed_users": ["one@example.com"]}
+    assert adapter._setting({}, extra, "X", "allowed_users") == "one@example.com"
 
 
 def test_html_sanitizer_drops_unknown_tags_and_preserves_safe_entities() -> None:
@@ -331,7 +350,14 @@ def test_authorization_mime_and_dispatch(adapter, monkeypatch) -> None:
     message["Message-ID"] = "<inbound@example.com>"
     message.set_content("plain")
     message.add_alternative("<b>html</b>", subtype="html")
-    message.add_attachment(b"image", maintype="image", subtype="png", filename="a.png")
+    image = b"\x89PNG\r\n\x1a\nimage"
+    cached = Path("/tmp") / "email-pp-test-image.png"
+    monkeypatch.setattr(
+        adapter_module,
+        "cache_image_from_bytes",
+        lambda payload, suffix: (cached.write_bytes(payload), str(cached))[1],
+    )
+    message.add_attachment(image, maintype="image", subtype="png", filename="a.png")
     assert adapter._permitted("person@example.com", message)
     assert not adapter._permitted("noreply@example.com", message)
     assert not adapter._permitted("other@example.com", message)
@@ -346,7 +372,7 @@ def test_authorization_mime_and_dispatch(adapter, monkeypatch) -> None:
     assert text == "plain\n"
     assert types == ["image/png"]
     assert kind == adapter_module.MessageType.PHOTO
-    assert Path(urls[0]).read_bytes() == b"image"
+    assert Path(urls[0]).read_bytes() == image
 
     handled: list[object] = []
 
@@ -361,6 +387,65 @@ def test_authorization_mime_and_dispatch(adapter, monkeypatch) -> None:
     assert ("person@example.com", "<inbound@example.com>") in adapter._routes
 
 
+def test_attachment_cache_classifies_media_and_fails_closed_for_bad_images(
+    adapter, monkeypatch, tmp_path
+) -> None:
+    calls: list[tuple[str, bytes]] = []
+
+    def cache(kind: str):
+        def store(payload: bytes, *args: object) -> str:
+            calls.append((kind, payload))
+            path = tmp_path / f"{kind}-{len(calls)}"
+            path.write_bytes(payload)
+            return str(path)
+
+        return store
+
+    monkeypatch.setattr(adapter_module, "cache_document_from_bytes", cache("document"))
+    monkeypatch.setattr(adapter_module, "cache_audio_from_bytes", cache("audio"))
+    monkeypatch.setattr(adapter_module, "cache_video_from_bytes", cache("video"))
+    monkeypatch.setattr(adapter_module, "cache_image_from_bytes", cache("image"))
+
+    image, image_kind = adapter._cache_attachment(
+        b"\x89PNG\r\n\x1a\nbody", "image/png", "image.png"
+    )
+    audio, audio_kind = adapter._cache_attachment(b"audio", "audio/ogg", "voice.ogg")
+    video, video_kind = adapter._cache_attachment(b"video", "video/mp4", "clip.mp4")
+    document, document_kind = adapter._cache_attachment(
+        b"text", "text/plain", "note.txt"
+    )
+
+    assert Path(image).read_bytes() == b"\x89PNG\r\n\x1a\nbody"
+    assert Path(audio).read_bytes() == b"audio"
+    assert Path(video).read_bytes() == b"video"
+    assert Path(document).read_bytes() == b"text"
+    assert (image_kind, audio_kind, video_kind, document_kind) == (
+        adapter_module.MessageType.PHOTO,
+        adapter_module.MessageType.AUDIO,
+        adapter_module.MessageType.VIDEO,
+        adapter_module.MessageType.DOCUMENT,
+    )
+
+    monkeypatch.setattr(
+        adapter_module,
+        "cache_image_from_bytes",
+        lambda *args: (_ for _ in ()).throw(ValueError("bad image")),
+    )
+    bad_image, bad_image_kind = adapter._cache_attachment(
+        b"not-an-image", "image/png", "bad.png"
+    )
+    assert Path(bad_image).read_bytes() == b"not-an-image"
+    assert bad_image_kind == adapter_module.MessageType.DOCUMENT
+
+    monkeypatch.setattr(
+        adapter_module,
+        "validate_inbound_media_size",
+        lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("too large")),
+    )
+    with pytest.raises(ValueError, match="too large"):
+        adapter._cache_attachment(b"large", "text/plain", "large.txt")
+
+
 def test_connect_disconnect_and_transport_failures(adapter, monkeypatch) -> None:
     calls: list[bool] = []
 
@@ -369,6 +454,8 @@ def test_connect_disconnect_and_transport_failures(adapter, monkeypatch) -> None
 
     monkeypatch.setattr(adapter, "_baseline_mailbox", baseline)
     monkeypatch.setattr(adapter, "_probe_smtp", lambda: None)
+    monkeypatch.setattr(adapter, "_acquire_platform_lock", lambda *args: True)
+    monkeypatch.setattr(adapter, "_release_platform_lock", lambda: None)
     assert asyncio.run(adapter.connect(is_reconnect=True))
     assert calls == [True]
     asyncio.run(adapter.disconnect())
@@ -376,6 +463,10 @@ def test_connect_disconnect_and_transport_failures(adapter, monkeypatch) -> None
     assert not asyncio.run(adapter.connect())
 
     adapter._address = "agent@example.com"
+
+    monkeypatch.setattr(adapter, "_acquire_platform_lock", lambda *args: False)
+    assert not asyncio.run(adapter.connect())
+    monkeypatch.setattr(adapter, "_acquire_platform_lock", lambda *args: True)
 
     def unavailable(reconnect: bool) -> None:
         raise OSError("down")

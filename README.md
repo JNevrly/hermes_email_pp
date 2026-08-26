@@ -1,7 +1,7 @@
 # Hermes Email++
 
-[![PyPI](https://img.shields.io/pypi/v/hermes_email_pp.svg)](https://pypi.python.org/pypi/hermes_email_pp)
-[![CI](https://github.com/JNevrly/hermes_email_pp/actions/workflows/ci.yml/badge.svg)](https://github.com/JNevrly/hermes_email_pp/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/hermes-email-pp.svg)](https://pypi.org/project/hermes-email-pp/)
+[![Release](https://github.com/JNevrly/hermes_email_pp/actions/workflows/release.yml/badge.svg)](https://github.com/JNevrly/hermes_email_pp/actions/workflows/release.yml)
 
 Hermes Email++ is a third-party IMAP/SMTP platform adapter for Hermes Agent.
 It is registered as `email_pp`, independently of Hermes' built-in `email`
@@ -11,22 +11,16 @@ inline forwards.
 
 ## Installation And Enablement
 
-Install this package into the same Python environment as a supported Hermes
-Agent 0.19 release:
+Install from the Hermes dashboard's **Settings > Plugins > Install from Git**
+flow using `JNevrly/hermes_email_pp`, then enable `email-pp` when prompted.
+Email++ requires Hermes Agent 0.20.5 or later in the 0.20 release line.
 
-```console
-$ python -m pip install hermes-email-pp
-$ hermes plugins enable email-pp
-```
+The dashboard installs the repository as a directory plugin. It stays disabled
+until you explicitly enable it. Restart the gateway after installing or
+changing configuration. `hermes plugins list` shows discovery and enablement,
+and `hermes gateway status` shows the registered and connected platforms.
 
-Pip-installed plugins are discovered through the `hermes_agent.plugins` entry
-point. Enabling `email-pp` explicitly permits this third-party code to load.
-Restart the gateway after installing or changing configuration. `hermes plugins
-list` shows discovery and enablement, and `hermes gateway status` shows the
-registered and connected platforms.
-
-Put the credentials in the active Hermes profile's `~/.hermes/.env` (or the
-profile-specific equivalent):
+Put the credentials in the active Hermes profile's environment settings:
 
 ```dotenv
 EMAIL_PP_ADDRESS=agent@example.com
@@ -41,14 +35,15 @@ All four required variables must be non-empty before environment-driven
 configuration enables Email++. The `EMAIL_PP_*` namespace is deliberately
 isolated: built-in `EMAIL_*` credentials are never read.
 
-Enable the Email++ gateway platform in `~/.hermes/config.yaml` when it is not
-auto-enabled from the complete required environment configuration:
+Enable the Email++ gateway platform in the active profile's `config.yaml` when
+it is not auto-enabled from the complete required environment configuration:
 
 ```yaml
-gateway:
-  platforms:
-    email_pp:
-      enabled: true
+plugins:
+  enabled: [email-pp]
+platforms:
+  email_pp:
+    enabled: true
 ```
 
 For a mailbox shared with the built-in adapter, use **only one** adapter. Keep
@@ -155,19 +150,23 @@ forwarded-message sender.
 
 ## Development Validation
 
-Run the complete release checks from a clean checkout:
+Run the complete release checks with an editable Hermes Agent v0.20.5 source
+checkout installed into the development environment:
 
 ```console
-$ uv run ruff check .
-$ uv run ruff format --check .
-$ uv run mypy hermes_email_pp
-$ uv run pytest --cov=hermes_email_pp tests/
+$ uv sync --group dev
+$ uv pip install -e /path/to/hermes-agent-v0.20.5
+$ .venv/bin/ruff check .
+$ .venv/bin/ruff format --check .
+$ .venv/bin/mypy hermes_email_pp
+$ .venv/bin/pytest --cov=hermes_email_pp tests/
 $ uv build --out-dir dist --clear
 ```
 
-The release smoke test installs the built wheel with a supported Hermes Agent
-0.19 release, then confirms the `email-pp` entry point loads without replacing
-the built-in `email` registration.
+The release workflow installs the official v0.20.5 source checkout in editable
+mode before running the adapter and Git-install contract tests. Its wheel smoke
+test confirms the `email-pp` entry point can load without replacing Hermes'
+built-in `email` registration.
 
 ## Releases
 

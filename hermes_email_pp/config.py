@@ -34,19 +34,38 @@ _CONFIG_KEYS = {
     "EMAIL_PP_SMTP_PORT": "smtp_port",
     "EMAIL_PP_POLL_INTERVAL": "poll_interval",
     "EMAIL_PP_MAILBOX": "mailbox",
+    "EMAIL_PP_ALLOWED_USERS": "allowed_users",
+    "EMAIL_PP_ALLOW_ALL_USERS": "allow_all_users",
     "EMAIL_PP_REQUIRE_AUTHENTICATED_SENDER": "require_authenticated_sender",
     "EMAIL_PP_AUTHSERV_ID": "authserv_id",
     "EMAIL_PP_QUOTE_MODE": "quote_mode",
 }
 
 
+def _secret(name: str) -> str:
+    """Read a profile-scoped value, preserving the default-profile fallback."""
+    try:
+        from agent.secret_scope import (  # type: ignore[import-not-found]
+            UnscopedSecretError,
+            get_secret,
+        )
+    except ImportError:
+        return os.environ.get(name, "")
+    try:
+        return get_secret(name, "") or ""
+    except UnscopedSecretError:
+        return os.environ.get(name, "")
+
+
 def environment_settings(environ: Mapping[str, str] | None = None) -> dict[str, str]:
     """Return non-blank Email++ settings without consulting built-in email vars."""
-    values = os.environ if environ is None else environ
+    values = environ
     return {
         key: value.strip()
         for key in (*REQUIRED_ENV, *OPTIONAL_ENV)
-        if (value := values.get(key, "")).strip()
+        if (
+            value := (values.get(key, "") if values is not None else _secret(key))
+        ).strip()
     }
 
 

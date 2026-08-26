@@ -67,6 +67,11 @@ jobs:
       - name: Install locked development dependencies
         run: uv sync --group dev --locked
 
+      - name: Install Hermes Agent test host
+        run: |
+          git clone --depth 1 --branch v2026.8.19 https://github.com/NousResearch/hermes-agent.git "$RUNNER_TEMP/hermes-agent"
+          uv pip install -e "$RUNNER_TEMP/hermes-agent"
+
       - name: Run quality checks
         run: |
           uv run ruff check .

@@ -5,7 +5,7 @@ from __future__ import annotations
 from importlib import import_module
 from typing import Any
 
-from hermes_email_pp.config import REQUIRED_ENV, environment_enablement, is_configured
+from .config import REQUIRED_ENV, environment_enablement, is_configured
 
 
 def check_requirements() -> bool:
@@ -15,7 +15,7 @@ def check_requirements() -> bool:
 
 def create_adapter(config: Any) -> Any:
     """Load the transport only when the gateway creates the Email++ adapter."""
-    adapter_module = import_module("hermes_email_pp.adapter")
+    adapter_module = import_module(".adapter", package=__package__)
     return adapter_module.EmailPPAdapter(config)
 
 

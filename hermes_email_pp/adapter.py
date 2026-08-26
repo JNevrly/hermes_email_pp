@@ -18,55 +18,29 @@ from email.utils import formatdate, parseaddr
 from pathlib import Path
 from typing import Any
 
-from hermes_email_pp.config import environment_settings
-from hermes_email_pp.forwarding import (
+from gateway.config import Platform  # type: ignore[import-not-found]
+from gateway.platforms.base import (  # type: ignore[import-not-found]
+    BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
+    SendResult,
+    cache_audio_from_bytes,
+    cache_document_from_bytes,
+    cache_image_from_bytes,
+    cache_video_from_bytes,
+    validate_inbound_media_size,
+)
+
+from .config import environment_settings
+from .forwarding import (
     ForwardedMessage,
     hermes_prompt,
     html_to_text,
     is_suspected_forward,
     parse_forward,
 )
-from hermes_email_pp.rendering import quote_html, quote_plain, render_markdown
-from hermes_email_pp.threading import EmailThreadRouter, ThreadRoute
-
-try:
-    from gateway.config import Platform  # type: ignore[import-not-found,import-untyped]
-    from gateway.platforms.base import (  # type: ignore[import-not-found,import-untyped]  # pragma: no cover
-        BasePlatformAdapter,
-        MessageEvent,
-        MessageType,
-        SendResult,
-    )
-except ImportError:  # pragma: no cover - supports isolated package tests
-
-    class BasePlatformAdapter:  # type: ignore[no-redef]
-        def __init__(self, config: Any, platform: Any) -> None:
-            self.config = config
-            self.platform = platform
-            self._running = False
-
-        def build_source(self, **kwargs: Any) -> Any:
-            return type("Source", (), kwargs)()
-
-        async def handle_message(self, event: Any) -> None:
-            return None
-
-    class MessageType:  # type: ignore[no-redef]
-        TEXT = "text"
-        PHOTO = "photo"
-        DOCUMENT = "document"
-
-    class MessageEvent:  # type: ignore[no-redef]
-        def __init__(self, **kwargs: Any) -> None:
-            self.__dict__.update(kwargs)
-
-    class SendResult:  # type: ignore[no-redef]
-        def __init__(self, success: bool, **kwargs: Any) -> None:
-            self.success = success
-            self.__dict__.update(kwargs)
-
-    Platform = type("Platform", (), {"EMAIL_PP": "email_pp"})
-
+from .rendering import quote_html, quote_plain, render_markdown
+from .threading import EmailThreadRouter, ThreadRoute
 
 _AUTOMATED = ("noreply", "no-reply", "mailer-daemon", "postmaster", "bounce")
 _IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
@@ -114,7 +88,7 @@ class EmailPPAdapter(BasePlatformAdapter):
     _seen_by_address: dict[str, set[bytes]] = {}
 
     def __init__(self, config: Any) -> None:
-        super().__init__(config, getattr(Platform, "EMAIL_PP", "email_pp"))
+        super().__init__(config, Platform("email_pp"))
         extra = getattr(config, "extra", {}) or {}
         settings = environment_settings()
         self._address = self._setting(settings, extra, "EMAIL_PP_ADDRESS", "address")
@@ -137,12 +111,17 @@ class EmailPPAdapter(BasePlatformAdapter):
         self._mailbox = (
             self._setting(settings, extra, "EMAIL_PP_MAILBOX", "mailbox") or "INBOX"
         )
+        allowed_users = self._setting(
+            settings, extra, "EMAIL_PP_ALLOWED_USERS", "allowed_users"
+        )
         self._allowed = {
             value.strip().lower()
-            for value in settings.get("EMAIL_PP_ALLOWED_USERS", "").split(",")
+            for value in allowed_users.split(",")
             if _address(value)
         }
-        self._allow_all = settings.get("EMAIL_PP_ALLOW_ALL_USERS", "").lower() in {
+        self._allow_all = self._setting(
+            settings, extra, "EMAIL_PP_ALLOW_ALL_USERS", "allow_all_users"
+        ).lower() in {
             "1",
             "true",
             "yes",
@@ -163,7 +142,10 @@ class EmailPPAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _setting(settings: dict[str, str], extra: Any, env: str, key: str) -> str:
-        return str(settings.get(env) or extra.get(key, "")).strip()
+        value = settings.get(env) or extra.get(key, "")
+        if isinstance(value, (list, tuple, set)):
+            value = ",".join(str(item) for item in value)
+        return str(value).strip()
 
     @classmethod
     def _integer(
@@ -189,11 +171,16 @@ class EmailPPAdapter(BasePlatformAdapter):
         if not all((self._address, self._password, self._imap_host, self._smtp_host)):
             return False
         try:
+            if not self._acquire_platform_lock(
+                "email_pp", self._address, "Email++ mailbox"
+            ):
+                return False
             await asyncio.to_thread(self._baseline_mailbox, is_reconnect)
             await asyncio.to_thread(self._probe_smtp)
         except (OSError, imaplib.IMAP4.error, smtplib.SMTPException):
+            self._release_platform_lock()
             return False
-        self._running = True
+        self._mark_connected()
         self._poll_task = asyncio.create_task(self._poll_loop())
         return True
 
@@ -207,6 +194,8 @@ class EmailPPAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 pass
             self._poll_task = None
+        self._release_platform_lock()
+        self._mark_disconnected()
 
     def _baseline_mailbox(self, is_reconnect: bool) -> None:
         imap = imaplib.IMAP4_SSL(self._imap_host, self._imap_port, timeout=30)
@@ -261,8 +250,10 @@ class EmailPPAdapter(BasePlatformAdapter):
                         continue
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                pass
+            except Exception as error:
+                self._set_fatal_error("poll_failed", str(error), retryable=True)
+                await self._notify_fatal_error()
+                return
             await asyncio.sleep(max(1, self._poll_interval))
 
     def _fetch_unseen(self) -> list[bytes]:
@@ -463,17 +454,36 @@ class EmailPPAdapter(BasePlatformAdapter):
             elif content_type == "text/html" and "attachment" not in disposition:
                 html = re.sub(r"<[^>]+>", "", payload.decode("utf-8", errors="replace"))
             elif "attachment" in disposition or part.get_filename():
-                suffix = Path(part.get_filename() or "attachment").suffix or ".bin"
-                path = Path("/tmp") / f"email-pp-{uuid.uuid4().hex}{suffix}"
-                path.write_bytes(payload)
-                urls.append(str(path))
-                types.append(content_type)
-                message_type = (
-                    MessageType.PHOTO
-                    if content_type in _IMAGE_TYPES
-                    else MessageType.DOCUMENT
+                path, attachment_type = self._cache_attachment(
+                    payload, content_type, part.get_filename()
                 )
+                urls.append(path)
+                types.append(content_type)
+                message_type = attachment_type
         return text or html, urls, types, message_type
+
+    @staticmethod
+    def _cache_attachment(
+        payload: bytes, content_type: str, filename: str | None
+    ) -> tuple[str, Any]:
+        """Store inbound media in Hermes' bounded profile cache."""
+        safe_name = filename or "attachment"
+        suffix = Path(safe_name).suffix or ".bin"
+        validate_inbound_media_size(len(payload), media_type="email attachment")
+        if content_type in _IMAGE_TYPES:
+            try:
+                return cache_image_from_bytes(payload, suffix), MessageType.PHOTO
+            except ValueError:
+                # A false image claim remains available as a document.
+                return (
+                    cache_document_from_bytes(payload, safe_name),
+                    MessageType.DOCUMENT,
+                )
+        if content_type.startswith("audio/"):
+            return cache_audio_from_bytes(payload, suffix), MessageType.AUDIO
+        if content_type.startswith("video/"):
+            return cache_video_from_bytes(payload, suffix), MessageType.VIDEO
+        return cache_document_from_bytes(payload, safe_name), MessageType.DOCUMENT
 
     async def send(
         self,
