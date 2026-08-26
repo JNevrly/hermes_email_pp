@@ -20,7 +20,12 @@ until you explicitly enable it. Restart the gateway after installing or
 changing configuration. `hermes plugins list` shows discovery and enablement,
 and `hermes gateway status` shows the registered and connected platforms.
 
-Put the credentials in the active Hermes profile's environment settings:
+In Hermes versions with the rich Channels card, select **Channels > Email++ >
+Configure** to enter all settings below. The card shows saved non-secret
+values, keeps the password write-only, and lets you use **Use default** to
+remove an optional override. Restart the gateway after saving. Hermes 0.20.5
+shows its compatible four-credential card instead; enter the remaining
+optional settings in the active profile environment settings:
 
 ```dotenv
 EMAIL_PP_ADDRESS=agent@example.com
@@ -72,6 +77,12 @@ Email++ platform configuration.
 | `EMAIL_PP_REQUIRE_AUTHENTICATED_SENDER` | No | `true` | Require a passing DMARC result in `Authentication-Results` for allowlisted senders. |
 | `EMAIL_PP_AUTHSERV_ID` | No | empty | Optional authentication-service identifier that must prefix the trusted `Authentication-Results` header. |
 | `EMAIL_PP_QUOTE_MODE` | No | `always` | `always` quotes the source email, `forwarded` quotes only parsed forwards, and `never` omits visible quotes. |
+
+`EMAIL_PP_ALLOW_ALL_USERS` accepts every non-automated sender and disables the
+allowlist and sender-authentication checks. Leave it disabled for an
+Internet-facing mailbox. The safer default,
+`EMAIL_PP_REQUIRE_AUTHENTICATED_SENDER=true`, remains enabled unless you
+explicitly turn it off.
 
 ## Email Behavior
 

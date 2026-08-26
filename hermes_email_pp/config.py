@@ -25,6 +25,116 @@ OPTIONAL_ENV = (
     "EMAIL_PP_QUOTE_MODE",
 )
 
+# Plain dictionaries keep this metadata importable on Hermes 0.20.5, which
+# predates the richer PlatformField registration contract.
+CHANNEL_FIELDS = (
+    {
+        "key": "EMAIL_PP_ADDRESS",
+        "label": "Email address",
+        "description": "Mailbox address and SMTP envelope identity.",
+        "required": True,
+    },
+    {
+        "key": "EMAIL_PP_PASSWORD",
+        "label": "Email password",
+        "description": "Mailbox password or provider-issued app password.",
+        "password": True,
+        "input_type": "password",
+        "required": True,
+    },
+    {
+        "key": "EMAIL_PP_IMAP_HOST",
+        "label": "IMAP host",
+        "description": "IMAP server hostname, for example imap.example.com.",
+        "required": True,
+    },
+    {
+        "key": "EMAIL_PP_SMTP_HOST",
+        "label": "SMTP host",
+        "description": "SMTP server hostname, for example smtp.example.com.",
+        "required": True,
+    },
+    {
+        "key": "EMAIL_PP_IMAP_PORT",
+        "label": "IMAP port",
+        "description": "IMAP-over-TLS port.",
+        "input_type": "number",
+        "default": 993,
+        "advanced": True,
+    },
+    {
+        "key": "EMAIL_PP_SMTP_PORT",
+        "label": "SMTP port",
+        "description": "SMTP STARTTLS port; use 465 for implicit TLS.",
+        "input_type": "number",
+        "default": 587,
+        "advanced": True,
+    },
+    {
+        "key": "EMAIL_PP_POLL_INTERVAL",
+        "label": "Poll interval (seconds)",
+        "description": (
+            "Inbox polling interval. Values below one second become one second."
+        ),
+        "input_type": "number",
+        "default": 15,
+        "advanced": True,
+    },
+    {
+        "key": "EMAIL_PP_MAILBOX",
+        "label": "Mailbox",
+        "description": "Mailbox selected for polling.",
+        "default": "INBOX",
+        "advanced": True,
+    },
+    {
+        "key": "EMAIL_PP_ALLOWED_USERS",
+        "label": "Allowed sender addresses",
+        "description": (
+            "Comma-separated sender-address allowlist. Required unless allow all "
+            "users is enabled."
+        ),
+    },
+    {
+        "key": "EMAIL_PP_ALLOW_ALL_USERS",
+        "label": "Allow all users",
+        "description": "Accept every non-automated sender.",
+        "input_type": "boolean",
+        "default": False,
+        "advanced": True,
+        "warning": (
+            "This bypasses the allowlist and sender-authentication checks. Do not "
+            "enable it for an Internet-facing mailbox."
+        ),
+    },
+    {
+        "key": "EMAIL_PP_REQUIRE_AUTHENTICATED_SENDER",
+        "label": "Require authenticated sender",
+        "description": "Require a passing DMARC result for allowlisted senders.",
+        "input_type": "boolean",
+        "default": True,
+        "advanced": True,
+    },
+    {
+        "key": "EMAIL_PP_AUTHSERV_ID",
+        "label": "Authentication service ID",
+        "description": (
+            "Optional service identifier that must prefix the trusted "
+            "Authentication-Results header."
+        ),
+        "advanced": True,
+    },
+    {
+        "key": "EMAIL_PP_QUOTE_MODE",
+        "label": "Quote mode",
+        "description": "Controls when the source email is visibly quoted in a reply.",
+        "input_type": "select",
+        "default": "always",
+        "options": ("always", "forwarded", "never"),
+        "advanced": True,
+    },
+)
+
 _CONFIG_KEYS = {
     "EMAIL_PP_ADDRESS": "address",
     "EMAIL_PP_PASSWORD": "password",

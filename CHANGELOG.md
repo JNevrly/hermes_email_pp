@@ -1,5 +1,9 @@
 # History
 
+## 0.2.1 (2026-08-26)
+
+* Expose complete typed Email++ configuration in the Hermes Channels card on supported Hermes versions.
+
 ## 0.2.0 (2026-08-26)
 
 * Support Hermes Agent 0.20.5 dashboard Git installation with scan-safe directory-plugin packaging.
