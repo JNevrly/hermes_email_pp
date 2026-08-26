@@ -5,7 +5,12 @@ from __future__ import annotations
 from importlib import import_module
 from typing import Any
 
-from .config import CHANNEL_FIELDS, REQUIRED_ENV, environment_enablement, is_configured
+from .config import (
+    CHANNEL_ENV,
+    CHANNEL_REQUIRED_ENV,
+    environment_enablement,
+    is_configured,
+)
 
 
 def check_requirements() -> bool:
@@ -21,6 +26,7 @@ def create_adapter(config: Any) -> Any:
 
 def register(ctx: Any) -> None:
     """Register Email++ without touching Hermes' built-in email platform."""
+    _register_channel_env_metadata()
     registration: dict[str, Any] = {
         "name": "email_pp",
         "label": "Email++",
@@ -28,7 +34,7 @@ def register(ctx: Any) -> None:
         "check_fn": check_requirements,
         "validate_config": is_configured,
         "is_connected": is_configured,
-        "required_env": list(REQUIRED_ENV),
+        "required_env": list(CHANNEL_REQUIRED_ENV),
         "env_enablement_fn": environment_enablement,
         "allowed_users_env": "EMAIL_PP_ALLOWED_USERS",
         "allow_all_env": "EMAIL_PP_ALLOW_ALL_USERS",
@@ -37,12 +43,21 @@ def register(ctx: Any) -> None:
             "You are responding by email. Keep replies clear and professional."
         ),
     }
-    try:
-        PlatformField = import_module("gateway.platform_registry").PlatformField
-    except (AttributeError, ImportError):
-        # Hermes 0.20.5 has no rich descriptor API. Its required_env card is
-        # still sufficient to configure the credentials needed for Email++.
-        pass
-    else:
-        registration["fields"] = [PlatformField(**field) for field in CHANNEL_FIELDS]
     ctx.register_platform(**registration)
+
+
+def _register_channel_env_metadata() -> None:
+    """Expose Email++ settings through vanilla Hermes' Channels metadata path."""
+    try:
+        optional_env_vars = import_module("hermes_cli.config").OPTIONAL_ENV_VARS
+    except (AttributeError, ImportError):
+        return
+    for field in CHANNEL_ENV:
+        name = field["name"]
+        optional_env_vars.setdefault(
+            name,
+            {
+                **field,
+                "category": "messaging",
+            },
+        )

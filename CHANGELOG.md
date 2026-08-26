@@ -1,5 +1,9 @@
 # History
 
+## 0.2.2 (2026-08-26)
+
+* Configure all Email++ settings in the vanilla Hermes Channels card without a custom Hermes core build.
+
 ## 0.2.1 (2026-08-26)
 
 * Expose complete typed Email++ configuration in the Hermes Channels card on supported Hermes versions.

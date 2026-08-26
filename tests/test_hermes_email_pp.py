@@ -17,7 +17,8 @@ import hermes_email_pp
 from hermes_email_pp import config as email_config
 from hermes_email_pp import threading as email_threading
 from hermes_email_pp.config import (
-    CHANNEL_FIELDS,
+    CHANNEL_ENV,
+    CHANNEL_REQUIRED_ENV,
     REQUIRED_ENV,
     environment_enablement,
     is_configured,
@@ -50,9 +51,18 @@ def test_root_directory_plugin_manifest_and_loader() -> None:
     assert manifest["name"] == "email-pp"
     assert manifest["kind"] == "platform"
     assert manifest["version"] == hermes_email_pp.__version__
-    assert "EMAIL_PP_PASSWORD" in {
+    required_names = {
         item["name"] if isinstance(item, dict) else item
         for item in manifest["requires_env"]
+    }
+    assert "EMAIL_PP_PASSWORD" in required_names
+    assert "EMAIL_PP_ALLOW_ALL_USERS" in required_names
+    optional_names = {
+        item["name"] if isinstance(item, dict) else item
+        for item in manifest["optional_env"]
+    }
+    assert optional_names == set(email_config.OPTIONAL_ENV) - {
+        "EMAIL_PP_ALLOW_ALL_USERS"
     }
 
     module_name = "test_directory_email_pp"
@@ -127,7 +137,8 @@ def test_readme_documents_dashboard_installation_and_enablement() -> None:
     assert "enabled: [email-pp]" in readme
     assert "Hermes Agent 0.20.5" in readme
     assert "Channels > Email++ >" in readme
-    assert "Use default" in readme
+    assert "true` or `false" in readme
+    assert "always`, `forwarded`, or `never" in readme
 
 
 def test_registers_email_pp_with_isolated_access_control() -> None:
@@ -136,77 +147,56 @@ def test_registers_email_pp_with_isolated_access_control() -> None:
     register(context)
 
     assert context.registration["name"] == "email_pp"
-    assert context.registration["required_env"] == list(REQUIRED_ENV)
+    assert context.registration["required_env"] == list(CHANNEL_REQUIRED_ENV)
     assert context.registration["allowed_users_env"] == "EMAIL_PP_ALLOWED_USERS"
     assert context.registration["allow_all_env"] == "EMAIL_PP_ALLOW_ALL_USERS"
 
 
-def test_register_falls_back_when_rich_field_descriptors_are_unavailable(
-    monkeypatch,
-) -> None:
-    import gateway.platform_registry as platform_registry
+def test_registers_all_channel_metadata_with_vanilla_hermes(monkeypatch) -> None:
+    from hermes_cli.config import OPTIONAL_ENV_VARS
 
-    monkeypatch.delattr(platform_registry, "PlatformField", raising=False)
+    for field in CHANNEL_ENV:
+        monkeypatch.delitem(OPTIONAL_ENV_VARS, field["name"], raising=False)
     context = RecordingContext()
 
     register(context)
 
     assert "fields" not in context.registration
+    assert set(OPTIONAL_ENV_VARS).issuperset(field["name"] for field in CHANNEL_ENV)
+    assert OPTIONAL_ENV_VARS["EMAIL_PP_PASSWORD"]["password"] is True
+    assert OPTIONAL_ENV_VARS["EMAIL_PP_QUOTE_MODE"]["category"] == "messaging"
 
 
-def test_registers_rich_field_descriptors_when_supported(monkeypatch) -> None:
-    class Field:
-        def __init__(self, **kwargs: object) -> None:
-            self.__dict__.update(kwargs)
-
-    gateway = ModuleType("gateway")
-    registry = ModuleType("gateway.platform_registry")
-    registry.PlatformField = Field
-    monkeypatch.setitem(sys.modules, "gateway", gateway)
-    monkeypatch.setitem(sys.modules, "gateway.platform_registry", registry)
-    context = RecordingContext()
-
-    register(context)
-
-    fields = context.registration["fields"]
-    assert len(fields) == 13
-    assert fields[0].key == "EMAIL_PP_ADDRESS"
-    assert fields[-1].options == ("always", "forwarded", "never")
-
-
-def test_rich_registration_is_discoverable_by_channels(monkeypatch) -> None:
+def test_vanilla_channels_discovers_all_email_pp_settings(monkeypatch) -> None:
     from gateway.platform_registry import PlatformEntry
+    from hermes_cli.config import OPTIONAL_ENV_VARS
     from hermes_cli.web_server import _build_catalog_entry
 
+    for field in CHANNEL_ENV:
+        monkeypatch.delitem(OPTIONAL_ENV_VARS, field["name"], raising=False)
     context = RecordingContext()
     register(context)
     entry = PlatformEntry(**context.registration)
     catalog = _build_catalog_entry("email_pp", entry)
 
-    assert catalog["required_env"] == tuple(REQUIRED_ENV)
-    assert [field.key for field in catalog["fields"]] == [
-        field["key"] for field in CHANNEL_FIELDS
-    ]
-    assert catalog["env_vars"][: len(CHANNEL_FIELDS)] == tuple(
-        field["key"] for field in CHANNEL_FIELDS
+    assert catalog["required_env"] == tuple(CHANNEL_REQUIRED_ENV)
+    assert set(catalog["env_vars"]) == set(REQUIRED_ENV) | set(
+        email_config.OPTIONAL_ENV
     )
 
 
-def test_channel_field_metadata_covers_every_email_pp_setting() -> None:
-    fields = {field["key"]: field for field in CHANNEL_FIELDS}
+def test_channel_environment_metadata_covers_every_email_pp_setting() -> None:
+    fields = {field["name"]: field for field in CHANNEL_ENV}
 
     assert set(fields) == set(REQUIRED_ENV) | set(email_config.OPTIONAL_ENV)
-    assert all(fields[key].get("required") for key in REQUIRED_ENV)
     assert fields["EMAIL_PP_PASSWORD"]["password"] is True
-    assert fields["EMAIL_PP_IMAP_PORT"]["input_type"] == "number"
-    assert fields["EMAIL_PP_ALLOW_ALL_USERS"]["input_type"] == "boolean"
-    assert "Internet-facing" in fields["EMAIL_PP_ALLOW_ALL_USERS"]["warning"]
-    assert fields["EMAIL_PP_REQUIRE_AUTHENTICATED_SENDER"]["default"] is True
-    assert fields["EMAIL_PP_QUOTE_MODE"]["options"] == (
-        "always",
-        "forwarded",
-        "never",
+    assert "Default: 993" in fields["EMAIL_PP_IMAP_PORT"]["description"]
+    assert "WARNING" in fields["EMAIL_PP_ALLOW_ALL_USERS"]["description"]
+    assert (
+        "Default: true"
+        in fields["EMAIL_PP_REQUIRE_AUTHENTICATED_SENDER"]["description"]
     )
+    assert "always, forwarded, or never" in fields["EMAIL_PP_QUOTE_MODE"]["description"]
 
 
 def test_configuration_never_reads_builtin_email_settings(monkeypatch) -> None:

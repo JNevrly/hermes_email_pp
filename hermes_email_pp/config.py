@@ -25,99 +25,91 @@ OPTIONAL_ENV = (
     "EMAIL_PP_QUOTE_MODE",
 )
 
-# Plain dictionaries keep this metadata importable on Hermes 0.20.5, which
-# predates the richer PlatformField registration contract.
-CHANNEL_FIELDS = (
+# Vanilla Hermes suppresses *_ALLOW_ALL_USERS optional fields from setup cards.
+# Keep this visible in Channels by requiring the explicit secure value "false".
+CHANNEL_REQUIRED_ENV = (*REQUIRED_ENV, "EMAIL_PP_ALLOW_ALL_USERS")
+
+# Metadata consumed by vanilla Hermes' OPTIONAL_ENV_VARS registry. The stock
+# Channels card renders each entry as a text or password input.
+CHANNEL_ENV = (
     {
-        "key": "EMAIL_PP_ADDRESS",
-        "label": "Email address",
+        "name": "EMAIL_PP_ADDRESS",
+        "prompt": "Email address",
         "description": "Mailbox address and SMTP envelope identity.",
-        "required": True,
     },
     {
-        "key": "EMAIL_PP_PASSWORD",
-        "label": "Email password",
+        "name": "EMAIL_PP_PASSWORD",
+        "prompt": "Email password",
         "description": "Mailbox password or provider-issued app password.",
         "password": True,
-        "input_type": "password",
-        "required": True,
     },
     {
-        "key": "EMAIL_PP_IMAP_HOST",
-        "label": "IMAP host",
+        "name": "EMAIL_PP_IMAP_HOST",
+        "prompt": "IMAP host",
         "description": "IMAP server hostname, for example imap.example.com.",
-        "required": True,
     },
     {
-        "key": "EMAIL_PP_SMTP_HOST",
-        "label": "SMTP host",
+        "name": "EMAIL_PP_SMTP_HOST",
+        "prompt": "SMTP host",
         "description": "SMTP server hostname, for example smtp.example.com.",
-        "required": True,
     },
     {
-        "key": "EMAIL_PP_IMAP_PORT",
-        "label": "IMAP port",
-        "description": "IMAP-over-TLS port.",
-        "input_type": "number",
-        "default": 993,
+        "name": "EMAIL_PP_IMAP_PORT",
+        "prompt": "IMAP port",
+        "description": "IMAP-over-TLS port. Default: 993.",
         "advanced": True,
     },
     {
-        "key": "EMAIL_PP_SMTP_PORT",
-        "label": "SMTP port",
-        "description": "SMTP STARTTLS port; use 465 for implicit TLS.",
-        "input_type": "number",
-        "default": 587,
+        "name": "EMAIL_PP_SMTP_PORT",
+        "prompt": "SMTP port",
+        "description": "SMTP STARTTLS port; use 465 for implicit TLS. Default: 587.",
         "advanced": True,
     },
     {
-        "key": "EMAIL_PP_POLL_INTERVAL",
-        "label": "Poll interval (seconds)",
+        "name": "EMAIL_PP_POLL_INTERVAL",
+        "prompt": "Poll interval (seconds)",
         "description": (
-            "Inbox polling interval. Values below one second become one second."
+            "Inbox polling interval. Values below one second become one second. "
+            "Default: 15."
         ),
-        "input_type": "number",
-        "default": 15,
         "advanced": True,
     },
     {
-        "key": "EMAIL_PP_MAILBOX",
-        "label": "Mailbox",
-        "description": "Mailbox selected for polling.",
-        "default": "INBOX",
+        "name": "EMAIL_PP_MAILBOX",
+        "prompt": "Mailbox",
+        "description": "Mailbox selected for polling. Default: INBOX.",
         "advanced": True,
     },
     {
-        "key": "EMAIL_PP_ALLOWED_USERS",
-        "label": "Allowed sender addresses",
+        "name": "EMAIL_PP_ALLOWED_USERS",
+        "prompt": "Allowed sender addresses",
         "description": (
             "Comma-separated sender-address allowlist. Required unless allow all "
             "users is enabled."
         ),
     },
     {
-        "key": "EMAIL_PP_ALLOW_ALL_USERS",
-        "label": "Allow all users",
-        "description": "Accept every non-automated sender.",
-        "input_type": "boolean",
-        "default": False,
+        "name": "EMAIL_PP_ALLOW_ALL_USERS",
+        "prompt": "Allow all users",
         "advanced": True,
-        "warning": (
-            "This bypasses the allowlist and sender-authentication checks. Do not "
-            "enable it for an Internet-facing mailbox."
+        "description": (
+            "Enter true to accept every non-automated sender. Default: false. "
+            "WARNING: this bypasses the allowlist and sender-authentication "
+            "checks; do not enable it for an Internet-facing mailbox."
         ),
     },
     {
-        "key": "EMAIL_PP_REQUIRE_AUTHENTICATED_SENDER",
-        "label": "Require authenticated sender",
-        "description": "Require a passing DMARC result for allowlisted senders.",
-        "input_type": "boolean",
-        "default": True,
+        "name": "EMAIL_PP_REQUIRE_AUTHENTICATED_SENDER",
+        "prompt": "Require authenticated sender",
+        "description": (
+            "Enter true to require a passing DMARC result for allowlisted senders. "
+            "Default: true."
+        ),
         "advanced": True,
     },
     {
-        "key": "EMAIL_PP_AUTHSERV_ID",
-        "label": "Authentication service ID",
+        "name": "EMAIL_PP_AUTHSERV_ID",
+        "prompt": "Authentication service ID",
         "description": (
             "Optional service identifier that must prefix the trusted "
             "Authentication-Results header."
@@ -125,12 +117,12 @@ CHANNEL_FIELDS = (
         "advanced": True,
     },
     {
-        "key": "EMAIL_PP_QUOTE_MODE",
-        "label": "Quote mode",
-        "description": "Controls when the source email is visibly quoted in a reply.",
-        "input_type": "select",
-        "default": "always",
-        "options": ("always", "forwarded", "never"),
+        "name": "EMAIL_PP_QUOTE_MODE",
+        "prompt": "Quote mode",
+        "description": (
+            "Controls when the source email is visibly quoted. Enter always, "
+            "forwarded, or never. Default: always."
+        ),
         "advanced": True,
     },
 )

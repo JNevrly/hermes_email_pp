@@ -20,12 +20,13 @@ until you explicitly enable it. Restart the gateway after installing or
 changing configuration. `hermes plugins list` shows discovery and enablement,
 and `hermes gateway status` shows the registered and connected platforms.
 
-In Hermes versions with the rich Channels card, select **Channels > Email++ >
-Configure** to enter all settings below. The card shows saved non-secret
-values, keeps the password write-only, and lets you use **Use default** to
-remove an optional override. Restart the gateway after saving. Hermes 0.20.5
-shows its compatible four-credential card instead; enter the remaining
-optional settings in the active profile environment settings:
+Select **Channels > Email++ > Configure** to enter all settings below. Vanilla
+Hermes renders these as text/password inputs: enter `true` or `false` for the
+two boolean settings, and `always`, `forwarded`, or `never` for quote mode.
+Leave optional fields blank to use their documented runtime defaults. Restart
+the gateway after saving. The card asks for **Allow all users** even though its
+secure runtime default is `false`: enter `false` unless you deliberately want
+to accept every non-automated sender.
 
 ```dotenv
 EMAIL_PP_ADDRESS=agent@example.com
