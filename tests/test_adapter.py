@@ -158,7 +158,12 @@ def test_header_helpers_are_safe() -> None:
     assert _address("Name <USER@example.com>") == "user@example.com"
     assert _address("not an address") == ""
     assert _decode("=?unknown?b?aGVsbG8=?=") == "hello"
+    assert _message_ids(1) == []
     assert _message_ids("<one@example.com> <two@example.com>") == [
+        "<one@example.com>",
+        "<two@example.com>",
+    ]
+    assert _message_ids("<one@example.com>\n <two@example.com>") == [
         "<one@example.com>",
         "<two@example.com>",
     ]
@@ -742,6 +747,7 @@ def test_forwarded_messages_create_fresh_private_review_drafts(
     message["From"] = "person@example.com"
     message["Subject"] = subject
     message["Message-ID"] = "<wrapper@example.com>"
+    message["References"] = "<root@example.com> <previous@example.com>"
     message.set_content(body)
     message.add_alternative(f"<p>{body.replace(chr(10), '<br>')}</p>", subtype="html")
 
@@ -773,9 +779,11 @@ def test_forwarded_messages_create_fresh_private_review_drafts(
     assert result.success
     draft = smtp.sent
     assert draft["To"] == "person@example.com"
-    assert draft["Subject"] == f"Draft: Re: {original_subject}"
-    assert draft["In-Reply-To"] is None
-    assert draft["References"] is None
+    assert draft["Subject"] == f"Re: {original_subject}"
+    assert draft["In-Reply-To"] == "<wrapper@example.com>"
+    assert draft["References"] == (
+        "<root@example.com> <previous@example.com> <wrapper@example.com>"
+    )
     plain, rich = draft.get_payload()
     plain_body = plain.get_payload(decode=True).decode()
     html_body = rich.get_payload(decode=True).decode()
@@ -883,6 +891,7 @@ def test_o365_html_forward_with_inline_image_creates_private_draft(
     message["From"] = "person@example.com"
     message["Subject"] = "FW: O365 HTML original"
     message["Message-ID"] = "<o365-html-wrapper@example.com>"
+    message["References"] = "<root@example.com>"
     message.set_content("This representation is intentionally empty.")
     message.add_alternative(
         "<html><head><title>IGNORED_TITLE</title><style>IGNORED_STYLE</style>"
@@ -916,9 +925,9 @@ def test_o365_html_forward_with_inline_image_creates_private_draft(
     assert result.success
     draft = smtp.sent
     assert draft["To"] == "person@example.com"
-    assert draft["Subject"] == "Draft: Re: O365 HTML original"
-    assert draft["In-Reply-To"] is None
-    assert draft["References"] is None
+    assert draft["Subject"] == "Re: O365 HTML original"
+    assert draft["In-Reply-To"] == "<o365-html-wrapper@example.com>"
+    assert draft["References"] == "<root@example.com> <o365-html-wrapper@example.com>"
     plain, rich = draft.get_payload()
     plain_body = plain.get_payload(decode=True).decode()
     html_body = rich.get_payload(decode=True).decode()

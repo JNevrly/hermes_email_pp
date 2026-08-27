@@ -43,7 +43,10 @@ def _message_ids(value: object) -> list[str] | None:
     """Parse a complete RFC Message-ID header, or reject it as malformed."""
     if value in (None, ""):
         return []
-    if not isinstance(value, str) or "\r" in value or "\n" in value:
+    if not isinstance(value, str):
+        return None
+    value = re.sub(r"\r?\n[ \t]+", " ", value)
+    if "\r" in value or "\n" in value:
         return None
     value = value.strip()
     if not value or _MESSAGE_IDS.fullmatch(value) is None:

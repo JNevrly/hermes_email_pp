@@ -1,5 +1,9 @@
 # History
 
+## 0.3.3 (2026-08-27)
+
+* Keep forwarded-review responses in the Outlook conversation with standard reply headers.
+
 ## 0.3.2 (2026-08-27)
 
 * Support standard Outlook/O365 plain-text and HTML inline forwarded emails.

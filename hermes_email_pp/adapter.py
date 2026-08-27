@@ -86,7 +86,10 @@ def _address(value: str) -> str:
 
 def _message_ids(value: object) -> list[str]:
     """Return valid Message-IDs without permitting header injection."""
-    if not isinstance(value, str) or "\r" in value or "\n" in value:
+    if not isinstance(value, str):
+        return []
+    value = re.sub(r"\r?\n[ \t]+", " ", value)
+    if "\r" in value or "\n" in value:
         return []
     return _MESSAGE_ID.findall(value) if _MESSAGE_IDS.fullmatch(value.strip()) else []
 
@@ -499,6 +502,8 @@ class EmailPPAdapter(BasePlatformAdapter):
         subject = _decode(message.get("Subject", ""))
         message_ids = _message_ids(message_id)
         references = _message_ids(message.get("References", ""))
+        if not references:
+            references = _message_ids(message.get("In-Reply-To", ""))
         if message_ids:
             references.append(message_ids[0])
         forward = self._forward(alternatives)
@@ -793,7 +798,7 @@ class EmailPPAdapter(BasePlatformAdapter):
         )
         if fresh_draft:
             original_subject = str(draft.get("original_subject", "")).strip()
-            subject = f"Draft: Re: {original_subject or 'Hermes Agent'}"
+            subject = f"Re: {original_subject or 'Hermes Agent'}"
         elif not subject.lower().startswith("re:"):
             subject = f"Re: {subject}" if subject else "Re: Hermes Agent"
         recipient_name = str(delivery.get("display_name", ""))
@@ -801,10 +806,9 @@ class EmailPPAdapter(BasePlatformAdapter):
         message["From"] = Address(display_name="Hermes Agent", addr_spec=self._address)
         message["To"] = Address(display_name=recipient_name, addr_spec=route.chat_id)
         message["Subject"] = subject
-        if not fresh_draft:
-            message["In-Reply-To"] = reply_ids[0]
-            references = _message_ids(str(quote_source.get("references", "")))
-            message["References"] = " ".join(dict.fromkeys([*references, reply_ids[0]]))
+        message["In-Reply-To"] = reply_ids[0]
+        references = _message_ids(str(quote_source.get("references", "")))
+        message["References"] = " ".join(dict.fromkeys([*references, reply_ids[0]]))
         message["Date"] = formatdate(localtime=True)
         message_id = f"<hermes-{uuid.uuid4().hex}@{self._address.rsplit('@', 1)[-1]}>"
         message["Message-ID"] = message_id

@@ -443,6 +443,10 @@ def test_threading_header_validation_and_profile_home_resolution(
 ) -> None:
     assert email_threading._message_ids(1) is None
     assert email_threading._message_ids("<one@example.com>\n<two@example.com>") is None
+    assert email_threading._message_ids("<one@example.com>\n <two@example.com>") == [
+        "<one@example.com>",
+        "<two@example.com>",
+    ]
     assert email_threading._message_ids("<one@example.com> <two@example.com>") == [
         "<one@example.com>",
         "<two@example.com>",

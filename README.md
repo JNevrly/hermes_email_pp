@@ -130,11 +130,11 @@ Outlook/O365 HTML forwards using an `hr` followed by the standard
 
 Use a short task prompt before the boundary, followed by a complete forwarded
 message with at least `From`, `Subject`, and a non-empty body. The first Hermes
-response is sent to the forwarder as a separate email with subject
-`Draft: Re: <original subject>`; it does not reply to the original
-correspondent and has no original-thread reply headers. The visible quote
-contains only the original message, never the wrapper task prompt. A reply to
-that draft stays in the same Hermes session and is sent as a normal revision.
+response is sent only to the forwarder as a threaded reply with subject
+`Re: <original subject>`. It never sends to the original correspondent; its
+visible quote contains only the original message, never the wrapper task
+prompt. A reply to that message stays in the same Hermes session and is sent as
+a normal revision.
 
 Only English Gmail and Outlook inline forwards matching the boundaries above
 are supported. Attachments-as-forwards, localized client formatting, nested or
