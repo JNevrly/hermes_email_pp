@@ -6,13 +6,17 @@ import asyncio
 import base64
 import email
 import imaplib
+import json
 import logging
 import mimetypes
+import os
 import re
 import secrets
 import smtplib
 import ssl
+import tempfile
 import uuid
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from email.header import decode_header
@@ -28,6 +32,7 @@ from gateway.platforms.base import (  # type: ignore[import-not-found]
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
+    ProcessingOutcome,
     SendResult,
     cache_audio_from_bytes,
     cache_document_from_bytes,
@@ -36,7 +41,7 @@ from gateway.platforms.base import (  # type: ignore[import-not-found]
     validate_inbound_media_size,
 )
 
-from .config import environment_settings, process_history_window
+from .config import delete_processed, environment_settings, process_history_window
 from .forwarding import (
     ForwardedMessage,
     hermes_prompt,
@@ -45,7 +50,7 @@ from .forwarding import (
     parse_forward,
 )
 from .rendering import quote_html, quote_plain, render_markdown
-from .threading import EmailThreadRouter, ThreadRoute
+from .threading import EmailThreadRouter, ThreadRoute, active_profile_home
 
 _AUTOMATED = ("noreply", "no-reply", "mailer-daemon", "postmaster", "bounce")
 _IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
@@ -67,6 +72,15 @@ class _MailboxState:
     uidvalidity: bytes | None
     baseline_uid: int
     seen: set[bytes]
+
+
+@dataclass(frozen=True)
+class _InboundMail:
+    """One fetched IMAP delivery bound to its UIDVALIDITY generation."""
+
+    raw: bytes
+    uid: bytes
+    uidvalidity: bytes | None
 
 
 def _decode(value: str) -> str:
@@ -223,6 +237,11 @@ class EmailPPAdapter(BasePlatformAdapter):
                 "process_history_window",
             )
         )
+        self._delete_processed = delete_processed(
+            self._setting(
+                settings, extra, "EMAIL_PP_DELETE_PROCESSED", "delete_processed"
+            )
+        )
         self._seen: set[bytes] = set()
         self._baseline_uid = 0
         self._uidvalidity: bytes | None = None
@@ -233,6 +252,11 @@ class EmailPPAdapter(BasePlatformAdapter):
         self._routes: dict[tuple[str, str], ThreadRoute] = {}
         self._outlook_reply_context: dict[tuple[str, str], tuple[str, str]] = {}
         self._router = EmailThreadRouter()
+        self._pending_deletions = self._load_pending_deletions()
+        self._inbound_deliveries: dict[tuple[str, str], _InboundMail] = {}
+        self._response_deliveries: set[tuple[str, str]] = set()
+        self._delivery_queues: dict[str, deque[MessageEvent]] = {}
+        self._active_delivery_threads: set[str] = set()
 
     @staticmethod
     def _setting(settings: dict[str, str], extra: Any, env: str, key: str) -> str:
@@ -275,6 +299,7 @@ class EmailPPAdapter(BasePlatformAdapter):
                 return False
             await asyncio.to_thread(self._baseline_mailbox, is_reconnect)
             await asyncio.to_thread(self._probe_smtp)
+            await asyncio.to_thread(self._retry_pending_deletions)
         except (OSError, imaplib.IMAP4.error, smtplib.SMTPException):
             logger.warning("Email++ connection validation failed")
             self._release_platform_lock()
@@ -323,6 +348,84 @@ class EmailPPAdapter(BasePlatformAdapter):
     @property
     def _mailbox_key(self) -> tuple[str, str]:
         return (self._address.lower(), self._mailbox)
+
+    @property
+    def _deletion_store_key(self) -> str:
+        """Keep acknowledgement records isolated across IMAP mailboxes."""
+        return "\0".join(
+            (
+                self._address.lower(),
+                self._imap_host.lower(),
+                str(self._imap_port),
+                self._mailbox,
+            )
+        )
+
+    @property
+    def _deletion_store_path(self) -> Path:
+        return active_profile_home() / "email_pp" / "pending_deletions.json"
+
+    def _load_pending_deletions(self) -> set[tuple[bytes, bytes]]:
+        """Load only validated, mailbox-local pending acknowledgement records."""
+        if not self._delete_processed:
+            return set()
+        try:
+            with self._deletion_store_path.open(encoding="utf-8") as handle:
+                stored = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            return set()
+        records = (
+            stored.get(self._deletion_store_key, []) if isinstance(stored, dict) else []
+        )
+        if not isinstance(records, list):
+            return set()
+        pending: set[tuple[bytes, bytes]] = set()
+        for record in records:
+            if not isinstance(record, list) or len(record) != 2:
+                continue
+            try:
+                uidvalidity = record[0].encode("ascii")
+                uid = record[1].encode("ascii")
+            except (AttributeError, UnicodeEncodeError):
+                continue
+            if uidvalidity and uid.isdigit():
+                pending.add((uidvalidity, uid))
+        return pending
+
+    def _save_pending_deletions(self) -> None:
+        """Atomically persist acknowledgement retries without storing mail content."""
+        if not self._delete_processed:
+            return
+        path = self._deletion_store_path
+        try:
+            with path.open(encoding="utf-8") as handle:
+                stored = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            stored = {}
+        if not isinstance(stored, dict):
+            stored = {}
+        stored[self._deletion_store_key] = [
+            [uidvalidity.decode("ascii"), uid.decode("ascii")]
+            for uidvalidity, uid in sorted(self._pending_deletions)
+        ]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(path.parent, 0o700)
+        descriptor, temporary = tempfile.mkstemp(
+            dir=path.parent, prefix=".pending-deletions-", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                os.fchmod(handle.fileno(), 0o600)
+                json.dump(stored, handle, sort_keys=True)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+        except BaseException:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+            raise
 
     def _restore_mailbox_state(self, state: _MailboxState) -> None:
         self._uidvalidity = state.uidvalidity
@@ -377,6 +480,98 @@ class EmailPPAdapter(BasePlatformAdapter):
         return values[0]
 
     @staticmethod
+    def _has_uidplus(imap: imaplib.IMAP4) -> bool:
+        """Return whether targeted UID EXPUNGE is available on this server."""
+        try:
+            status, data = imap.capability()
+        except (AttributeError, imaplib.IMAP4.error):
+            return False
+        return (
+            status == "OK"
+            and isinstance(data, (list, tuple))
+            and b"UIDPLUS"
+            in b" ".join(
+                value.upper() for value in data if isinstance(value, bytes)
+            ).split()
+        )
+
+    def _retry_pending_deletions(self) -> None:
+        """Retry recorded UID-targeted deletions without redispatching mail."""
+        if not self._delete_processed or not self._pending_deletions:
+            return
+        imap = imaplib.IMAP4_SSL(self._imap_host, self._imap_port, timeout=30)
+        changed = False
+        try:
+            imap.login(self._address, self._password)
+            uidvalidity = self._select_mailbox(imap)
+            if uidvalidity is None:
+                logger.warning("Email++ cannot delete mail without UIDVALIDITY")
+                return
+            if not self._has_uidplus(imap):
+                logger.warning(
+                    "Email++ cannot delete processed mail because IMAP UIDPLUS is "
+                    "unavailable"
+                )
+                return
+            for expected_uidvalidity, uid in tuple(self._pending_deletions):
+                if expected_uidvalidity != uidvalidity:
+                    # UIDs may refer to unrelated mail after a UIDVALIDITY change.
+                    self._pending_deletions.remove((expected_uidvalidity, uid))
+                    changed = True
+                    logger.warning(
+                        "Email++ discarded stale processed-mail deletion after "
+                        "UIDVALIDITY changed"
+                    )
+                    continue
+                status, _ = imap.uid(
+                    "store", uid.decode("ascii"), "+FLAGS.SILENT", r"(\Deleted)"
+                )
+                if status != "OK":
+                    logger.warning("Email++ could not mark processed mail for deletion")
+                    continue
+                status, _ = imap.uid("expunge", uid.decode("ascii"))
+                if status != "OK":
+                    logger.warning("Email++ could not expunge processed mail by UID")
+                    continue
+                self._pending_deletions.remove((expected_uidvalidity, uid))
+                changed = True
+                logger.info("Email++ deleted successfully processed mail")
+        finally:
+            self._close_imap(imap)
+            if changed:
+                self._save_pending_deletions()
+
+    def _remember_processed_delivery(self, delivery: _InboundMail) -> None:
+        """Persist a successful response before attempting destructive cleanup."""
+        if delivery.uidvalidity is None:
+            logger.warning("Email++ retained processed mail without UIDVALIDITY")
+            return
+        self._pending_deletions.add((delivery.uidvalidity, delivery.uid))
+        self._save_pending_deletions()
+        self._retry_pending_deletions()
+
+    def _mark_seen(self, delivery: _InboundMail) -> None:
+        """Retain terminal rejected mail without repeatedly evaluating it."""
+        imap = imaplib.IMAP4_SSL(self._imap_host, self._imap_port, timeout=30)
+        try:
+            imap.login(self._address, self._password)
+            if self._select_mailbox(imap) != delivery.uidvalidity:
+                logger.warning("Email++ did not mark stale rejected mail as seen")
+                return
+            status, _ = imap.uid(
+                "store", delivery.uid.decode("ascii"), "+FLAGS.SILENT", r"(\Seen)"
+            )
+            if status != "OK":
+                logger.warning("Email++ could not mark rejected mail as seen")
+        finally:
+            self._close_imap(imap)
+
+    def _release_for_retry(self, delivery: _InboundMail) -> None:
+        """Make a failed non-destructive delivery eligible for a later poll."""
+        self._seen.discard(delivery.uid)
+        self._save_mailbox_state()
+
+    @staticmethod
     def _search_uids(imap: imaplib.IMAP4, criteria: str) -> list[bytes]:
         status, data = imap.uid("search", None, criteria)  # type: ignore[arg-type]
         if status != "OK":
@@ -422,12 +617,15 @@ class EmailPPAdapter(BasePlatformAdapter):
         while self._running:
             try:
                 messages = await asyncio.to_thread(self._fetch_unseen)
+                await asyncio.to_thread(self._retry_pending_deletions)
                 logger.debug("Email++ IMAP poll fetched batch_size=%d", len(messages))
-                for raw in messages:
+                for delivery in messages:
                     try:
-                        await self._dispatch(raw)
+                        await self._dispatch(delivery)
                     except Exception:
                         logger.warning("Email++ IMAP message dispatch failed")
+                        if self._delete_processed:
+                            await asyncio.to_thread(self._release_for_retry, delivery)
                         continue
             except asyncio.CancelledError:
                 raise
@@ -440,18 +638,23 @@ class EmailPPAdapter(BasePlatformAdapter):
                 return
             await asyncio.sleep(max(1, self._poll_interval))
 
-    def _fetch_unseen(self) -> list[bytes]:
+    def _fetch_unseen(self) -> list[_InboundMail]:
         imap = imaplib.IMAP4_SSL(self._imap_host, self._imap_port, timeout=30)
-        messages: list[bytes] = []
+        messages: list[_InboundMail] = []
         try:
             imap.login(self._address, self._password)
             uidvalidity = self._select_mailbox(imap)
+            if self._delete_processed and uidvalidity is None:
+                raise imaplib.IMAP4.error("IMAP UIDVALIDITY is required for deletion")
             if uidvalidity != self._uidvalidity:
                 logger.warning("Email++ IMAP UIDVALIDITY changed during polling")
                 self._start_cold_mailbox(imap, uidvalidity)
             attempts = 0
             for uid in sorted(
-                self._search_uids(imap, "UNSEEN"), key=self._uid_sort_key
+                self._search_uids(
+                    imap, "UNSEEN UNDELETED" if self._delete_processed else "UNSEEN"
+                ),
+                key=self._uid_sort_key,
             ):
                 if uid in self._seen:
                     continue
@@ -466,7 +669,7 @@ class EmailPPAdapter(BasePlatformAdapter):
                 if attempts >= _POLL_BATCH_SIZE:
                     break
                 attempts += 1
-                fetched = self._fetch_message(imap, uid)
+                fetched = self._fetch_message(imap, uid, peek=self._delete_processed)
                 if fetched is None:
                     continue
                 raw, internaldate = fetched
@@ -483,7 +686,7 @@ class EmailPPAdapter(BasePlatformAdapter):
                     self._seen.add(uid)
                     continue
                 self._seen.add(uid)
-                messages.append(raw)
+                messages.append(_InboundMail(raw, uid, uidvalidity))
             self._trim_seen()
             self._save_mailbox_state()
             if attempts:
@@ -502,9 +705,10 @@ class EmailPPAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _fetch_message(
-        imap: imaplib.IMAP4, uid: bytes
+        imap: imaplib.IMAP4, uid: bytes, *, peek: bool = False
     ) -> tuple[bytes, datetime | None] | None:
-        status, data = imap.uid("fetch", uid.decode("ascii"), "(RFC822 INTERNALDATE)")
+        item = "BODY.PEEK[]" if peek else "RFC822"
+        status, data = imap.uid("fetch", uid.decode("ascii"), f"({item} INTERNALDATE)")
         if status != "OK" or not isinstance(data, (list, tuple)) or not data:
             logger.warning("Email++ IMAP message fetch failed")
             return None
@@ -517,7 +721,7 @@ class EmailPPAdapter(BasePlatformAdapter):
             if (
                 not isinstance(descriptor, bytes)
                 or not isinstance(literal, bytes)
-                or b"RFC822" not in descriptor
+                or (b"RFC822" not in descriptor and b"BODY[" not in descriptor)
             ):
                 continue
             raw = literal
@@ -546,10 +750,19 @@ class EmailPPAdapter(BasePlatformAdapter):
         if len(self._seen) > 2000:
             self._seen = set(sorted(self._seen, key=int)[-1000:])
 
-    async def _dispatch(self, raw: bytes) -> None:
+    async def _dispatch(self, inbound: bytes | _InboundMail) -> None:
+        """Build an event and retain its IMAP identity until terminal delivery."""
+        delivery = inbound if isinstance(inbound, _InboundMail) else None
+        if delivery is None:
+            assert isinstance(inbound, bytes)
+            raw = inbound
+        else:
+            raw = delivery.raw
         message = email.message_from_bytes(raw)
         sender = _address(message.get("From", ""))
         if not self._permitted(sender, message):
+            if self._delete_processed and delivery is not None:
+                await asyncio.to_thread(self._mark_seen, delivery)
             return
         route = self._router.resolve(
             sender,
@@ -584,7 +797,12 @@ class EmailPPAdapter(BasePlatformAdapter):
                 quote_source={"body": "", "is_forwarded": "false"},
                 draft_context={"is_forwarded": "false", "draft_sent": "true"},
             )
-            await self._send_unsafe_forward_notice(route, message_id)
+            sent_notice = await self._send_unsafe_forward_notice(route, message_id)
+            if self._delete_processed and delivery is not None:
+                if sent_notice:
+                    await asyncio.to_thread(self._remember_processed_delivery, delivery)
+                else:
+                    await asyncio.to_thread(self._mark_seen, delivery)
             return
         self._router.update_context(
             route,
@@ -609,17 +827,72 @@ class EmailPPAdapter(BasePlatformAdapter):
             thread_id=route.thread_id,
             message_id=message_id or None,
         )
-        await self.handle_message(
-            MessageEvent(
-                text=hermes_prompt(forward) if forward else text or "(empty email)",
-                message_type=message_type,
-                source=source,
-                message_id=message_id or None,
-                reply_to_message_id=message.get("In-Reply-To") or None,
-                media_urls=urls,
-                media_types=types,
-            )
+        event = MessageEvent(
+            text=hermes_prompt(forward) if forward else text or "(empty email)",
+            message_type=message_type,
+            source=source,
+            raw_message=delivery,
+            message_id=message_id or None,
+            reply_to_message_id=message.get("In-Reply-To") or None,
+            media_urls=urls,
+            media_types=types,
         )
+        if self._delete_processed and delivery is not None:
+            if event.message_id is None:
+                await asyncio.to_thread(self._mark_seen, delivery)
+                return
+            self._inbound_deliveries[(route.chat_id, event.message_id)] = delivery
+            await self._queue_delivery(event)
+            return
+        await self.handle_message(event)
+
+    async def _queue_delivery(self, event: MessageEvent) -> None:
+        """Serialize mail per Hermes thread so completion maps to one UID."""
+        thread_id = event.source.thread_id
+        if thread_id in self._active_delivery_threads:
+            self._delivery_queues.setdefault(thread_id, deque()).append(event)
+            return
+        self._active_delivery_threads.add(thread_id)
+        await self.handle_message(event)
+
+    def _start_next_delivery(self, thread_id: str) -> None:
+        """Schedule the next event after Hermes releases the current session guard."""
+        queue = self._delivery_queues.get(thread_id)
+        if queue:
+            event = queue.popleft()
+            if not queue:
+                self._delivery_queues.pop(thread_id, None)
+            task = asyncio.create_task(self.handle_message(event))
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+            return
+        self._active_delivery_threads.discard(thread_id)
+
+    async def on_processing_complete(
+        self, event: MessageEvent, outcome: ProcessingOutcome
+    ) -> None:
+        """Acknowledge only SMTP-delivered email after Hermes reaches SUCCESS."""
+        delivery = (
+            event.raw_message if isinstance(event.raw_message, _InboundMail) else None
+        )
+        if delivery is None or not self._delete_processed:
+            return
+        key = (event.source.chat_id.lower(), event.message_id or "")
+        delivered = key in self._response_deliveries
+        self._response_deliveries.discard(key)
+        self._inbound_deliveries.pop(key, None)
+        try:
+            if outcome is ProcessingOutcome.SUCCESS and delivered:
+                if delivery.uidvalidity is None:
+                    logger.warning(
+                        "Email++ retained processed mail without UIDVALIDITY"
+                    )
+                else:
+                    await asyncio.to_thread(self._remember_processed_delivery, delivery)
+            else:
+                await asyncio.to_thread(self._release_for_retry, delivery)
+        finally:
+            self._start_next_delivery(event.source.thread_id)
 
     @staticmethod
     def _text_alternatives(message: Any) -> list[str]:
@@ -663,10 +936,10 @@ class EmailPPAdapter(BasePlatformAdapter):
 
     async def _send_unsafe_forward_notice(
         self, route: ThreadRoute, message_id: str
-    ) -> None:
+    ) -> bool:
         reply_ids = _message_ids(message_id)
         if len(reply_ids) != 1:
-            return
+            return False
         content = (
             "I could not safely identify the boundary between your task and "
             "the forwarded message, so no review draft was created. Please "
@@ -678,6 +951,7 @@ class EmailPPAdapter(BasePlatformAdapter):
         )
         self._routes[(route.chat_id, sent)] = route
         self._router.record_outbound(route, sent)
+        return True
 
     def _permitted(self, sender: str, message: Any) -> bool:
         if (
@@ -829,6 +1103,8 @@ class EmailPPAdapter(BasePlatformAdapter):
             )
             self._routes[(route.chat_id, message_id)] = route
             self._router.record_outbound(route, message_id)
+            if reply_to:
+                self._response_deliveries.add((route.chat_id.lower(), reply_to))
             return SendResult(success=True, message_id=message_id)
         except (OSError, smtplib.SMTPException, ValueError) as error:
             return SendResult(success=False, error=str(error))

@@ -79,6 +79,7 @@ Email++ platform configuration.
 | `EMAIL_PP_AUTHSERV_ID` | No | empty | Optional authentication-service identifier that must prefix the trusted `Authentication-Results` header. |
 | `EMAIL_PP_QUOTE_MODE` | No | `always` | `always` quotes the source email, `forwarded` quotes only parsed forwards, and `never` omits visible quotes. |
 | `EMAIL_PP_PROCESS_HISTORY_WINDOW` | No | `0` | Unread mail recovery at a cold gateway start: `0` skips existing mail, `-1` processes all unread mail, and a positive exact-second window processes only unread mail newer than that cutoff. |
+| `EMAIL_PP_DELETE_PROCESSED` | No | `false` | Delete authorized email only after Hermes completes successfully and its reply is accepted by SMTP. Requires IMAP UIDPLUS support. |
 
 `EMAIL_PP_ALLOW_ALL_USERS` accepts every non-automated sender and disables the
 allowlist and sender-authentication checks. Leave it disabled for an
@@ -92,6 +93,13 @@ recover all unread mail, or to a positive number of seconds to recover only
 recent unread mail. Invalid values and values below `-1` prevent the adapter
 from starting. Automatic reconnects in a running gateway retain their mailbox
 state and process unread mail received during the outage.
+
+Set `EMAIL_PP_DELETE_PROCESSED=true` only for a dedicated agent mailbox when
+you want successful requests removed automatically. Email++ retains rejected,
+malformed, cancelled, and failed requests. It records a successful response
+before deleting and retries a failed mailbox deletion without rerunning Hermes.
+Deletion requires IMAP `UIDPLUS`; Email++ never uses broad `EXPUNGE`, so it
+cannot remove messages another mailbox client has marked for deletion.
 
 ## Email Behavior
 

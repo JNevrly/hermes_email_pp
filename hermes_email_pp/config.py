@@ -24,6 +24,7 @@ OPTIONAL_ENV = (
     "EMAIL_PP_AUTHSERV_ID",
     "EMAIL_PP_QUOTE_MODE",
     "EMAIL_PP_PROCESS_HISTORY_WINDOW",
+    "EMAIL_PP_DELETE_PROCESSED",
 )
 
 # Vanilla Hermes suppresses *_ALLOW_ALL_USERS optional fields from setup cards.
@@ -136,6 +137,15 @@ CHANNEL_ENV = (
         ),
         "advanced": True,
     },
+    {
+        "name": "EMAIL_PP_DELETE_PROCESSED",
+        "prompt": "Delete successfully processed email",
+        "description": (
+            "Enter true to remove authorized email only after Hermes replies "
+            "successfully. Default: false."
+        ),
+        "advanced": True,
+    },
 )
 
 _CONFIG_KEYS = {
@@ -153,6 +163,7 @@ _CONFIG_KEYS = {
     "EMAIL_PP_AUTHSERV_ID": "authserv_id",
     "EMAIL_PP_QUOTE_MODE": "quote_mode",
     "EMAIL_PP_PROCESS_HISTORY_WINDOW": "process_history_window",
+    "EMAIL_PP_DELETE_PROCESSED": "delete_processed",
 }
 
 
@@ -203,6 +214,16 @@ def process_history_window(value: object) -> int:
     return window
 
 
+def delete_processed(value: object) -> bool:
+    """Validate the opt-in processed-email deletion setting."""
+    raw = str(value).strip().lower()
+    if not raw or raw in {"0", "false", "no", "off"}:
+        return False
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    raise ValueError("EMAIL_PP_DELETE_PROCESSED must be true or false")
+
+
 def is_configured(config: Any, environ: Mapping[str, str] | None = None) -> bool:
     """Return whether isolated environment or platform config supplies all secrets."""
     extra = getattr(config, "extra", {})
@@ -220,6 +241,9 @@ def is_configured(config: Any, environ: Mapping[str, str] | None = None) -> bool
             "EMAIL_PP_PROCESS_HISTORY_WINDOW",
             extra.get("process_history_window", ""),
         )
+    )
+    delete_processed(
+        settings.get("EMAIL_PP_DELETE_PROCESSED", extra.get("delete_processed", ""))
     )
     return True
 

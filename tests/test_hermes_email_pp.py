@@ -21,6 +21,7 @@ from hermes_email_pp.config import (
     CHANNEL_ENV,
     CHANNEL_REQUIRED_ENV,
     REQUIRED_ENV,
+    delete_processed,
     environment_enablement,
     is_configured,
     process_history_window,
@@ -281,6 +282,28 @@ def test_process_history_window_validation_and_environment_mapping(monkeypatch) 
     assert environment_enablement()["process_history_window"] == "60"
     monkeypatch.setenv("EMAIL_PP_PROCESS_HISTORY_WINDOW", "invalid")
     with pytest.raises(ValueError, match="PROCESS_HISTORY_WINDOW"):
+        is_configured(SimpleNamespace(extra={}))
+
+
+def test_processed_mail_deletion_validation_and_environment_mapping(
+    monkeypatch,
+) -> None:
+    assert not delete_processed("")
+    assert not delete_processed("false")
+    assert delete_processed("true")
+    assert delete_processed("1")
+    with pytest.raises(ValueError, match="DELETE_PROCESSED"):
+        delete_processed("sometimes")
+    for name, value in zip(
+        REQUIRED_ENV,
+        ("agent@example.com", "secret", "imap.example.com", "smtp.example.com"),
+        strict=True,
+    ):
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("EMAIL_PP_DELETE_PROCESSED", "true")
+    assert environment_enablement()["delete_processed"] == "true"
+    monkeypatch.setenv("EMAIL_PP_DELETE_PROCESSED", "invalid")
+    with pytest.raises(ValueError, match="DELETE_PROCESSED"):
         is_configured(SimpleNamespace(extra={}))
 
 

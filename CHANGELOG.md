@@ -1,5 +1,9 @@
 # History
 
+## 0.4.0 (2026-08-27)
+
+* Add opt-in, UID-safe deletion of email after Hermes completes and SMTP accepts its reply.
+
 ## 0.3.4 (2026-08-27)
 
 * Preserve Outlook conversation metadata and valid reply identifiers for forwarded-review responses.

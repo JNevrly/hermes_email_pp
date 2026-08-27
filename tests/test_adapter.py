@@ -88,6 +88,8 @@ class IMAP:
                     b' INTERNALDATE "26-Aug-2026 12:00:00 +0000")',
                 ],
             ),
+            "store": ("OK", []),
+            "expunge": ("OK", []),
         }
 
     def login(self, *args: object) -> None:
@@ -105,7 +107,12 @@ class IMAP:
         self.calls.append((command, args))
         if command == "search" and args[0] == "":
             return "OK", [b""]
+        if command in {"store", "expunge"}:
+            return self.responses[command]
         return self.responses[args[-1] if command == "search" else "fetch"]
+
+    def capability(self) -> tuple[str, list[bytes]]:
+        return "OK", [b"IMAP4rev1 UIDPLUS"]
 
     def logout(self) -> None:
         self.logged_out = True
@@ -232,9 +239,8 @@ def test_tls_baseline_fetch_and_reconnect(adapter, monkeypatch) -> None:
     assert instances[0].uid("search", "", "UNSEEN") == ("OK", [b""])
     adapter._baseline_mailbox(True)
     assert adapter._baseline_uid == 2
-    assert adapter._fetch_unseen() == [
-        b"From: person@example.com\n\nhello",
-        b"From: person@example.com\n\nhello",
+    assert [delivery.raw for delivery in adapter._fetch_unseen()] == 2 * [
+        b"From: person@example.com\n\nhello"
     ]
     assert instances[-1].calls[0] == ("search", (None, "UNSEEN"))
     adapter._seen = {str(value).encode() for value in range(2001)}
@@ -290,8 +296,307 @@ def test_imap_poll_logs_only_fetch_attempts(adapter, monkeypatch, caplog) -> Non
             b' INTERNALDATE "26-Aug-2026 12:00:00 +0000")',
         ],
     )
-    assert adapter._fetch_unseen() == [b"From: person@example.com\n\nhello"]
+    assert [delivery.raw for delivery in adapter._fetch_unseen()] == [
+        b"From: person@example.com\n\nhello"
+    ]
     assert "completed poll batch (fetched=1, attempted=1)" in caplog.text
+
+
+def test_processed_mail_deletion_is_uidplus_only_and_recovers(
+    adapter, monkeypatch, tmp_path
+) -> None:
+    imap = IMAP()
+    imap.responses["UNSEEN UNDELETED"] = ("OK", [b"3"])
+    monkeypatch.setattr(adapter_module, "active_profile_home", lambda: tmp_path)
+    monkeypatch.setattr(
+        adapter_module.imaplib, "IMAP4_SSL", lambda *args, **kwargs: imap
+    )
+    adapter._delete_processed = True
+    adapter._pending_deletions = {(b"1", b"3")}
+    adapter._save_pending_deletions()
+
+    adapter._retry_pending_deletions()
+
+    assert ("store", ("3", "+FLAGS.SILENT", r"(\Deleted)")) in imap.calls
+    assert ("expunge", ("3",)) in imap.calls
+    assert adapter._pending_deletions == set()
+    assert not any(command == "EXPUNGE" for command, _ in imap.calls)
+
+    adapter._pending_deletions = {(b"1", b"3")}
+    adapter._save_pending_deletions()
+    imap.responses["store"] = ("NO", [])
+    adapter._retry_pending_deletions()
+    assert adapter._pending_deletions == {(b"1", b"3")}
+    assert adapter._load_pending_deletions() == {(b"1", b"3")}
+
+    adapter._seen.clear()
+    adapter._baseline_mailbox(False)
+    deliveries = adapter._fetch_unseen()
+    assert deliveries[0].uid == b"3"
+    assert deliveries[0].uidvalidity == b"1"
+    assert ("search", (None, "UNSEEN UNDELETED")) in imap.calls
+    assert ("fetch", ("3", "(BODY.PEEK[] INTERNALDATE)")) in imap.calls
+
+
+def test_processed_mail_requires_uidplus_and_keeps_rejected_mail(
+    adapter, monkeypatch, tmp_path
+) -> None:
+    imap = IMAP()
+    monkeypatch.setattr(adapter_module, "active_profile_home", lambda: tmp_path)
+    monkeypatch.setattr(
+        adapter_module.imaplib, "IMAP4_SSL", lambda *args, **kwargs: imap
+    )
+    adapter._delete_processed = True
+    adapter._pending_deletions = {(b"1", b"3")}
+    monkeypatch.setattr(imap, "capability", lambda: ("OK", [b"IMAP4rev1"]))
+
+    adapter._retry_pending_deletions()
+
+    assert adapter._pending_deletions == {(b"1", b"3")}
+    assert not any(command in {"store", "expunge"} for command, _ in imap.calls)
+
+    delivery = adapter_module._InboundMail(
+        b"From: other@example.com\n\nignored", b"4", b"1"
+    )
+    asyncio.run(adapter._dispatch(delivery))
+    assert ("store", ("4", "+FLAGS.SILENT", r"(\Seen)")) in imap.calls
+    assert (b"1", b"4") not in adapter._pending_deletions
+
+
+def test_completion_only_acknowledges_smtp_delivered_mail(adapter, monkeypatch) -> None:
+    adapter._delete_processed = True
+    delivery = adapter_module._InboundMail(b"raw", b"3", b"1")
+    event = SimpleNamespace(
+        raw_message=delivery,
+        source=SimpleNamespace(
+            chat_id="person@example.com", thread_id="email_pp:thread"
+        ),
+        message_id="<inbound@example.com>",
+    )
+    key = ("person@example.com", "<inbound@example.com>")
+    adapter._inbound_deliveries[key] = delivery
+    adapter._response_deliveries.add(key)
+    acknowledged: list[adapter_module._InboundMail] = []
+    advanced: list[str] = []
+
+    def start_next(thread_id: str) -> None:
+        advanced.append(thread_id)
+
+    monkeypatch.setattr(
+        adapter,
+        "_remember_processed_delivery",
+        lambda received: acknowledged.append(received),
+    )
+    monkeypatch.setattr(adapter, "_start_next_delivery", start_next)
+
+    asyncio.run(
+        adapter.on_processing_complete(event, adapter_module.ProcessingOutcome.SUCCESS)
+    )
+
+    assert acknowledged == [delivery]
+    assert advanced == ["email_pp:thread"]
+    assert key not in adapter._inbound_deliveries
+
+    retried: list[adapter_module._InboundMail] = []
+    monkeypatch.setattr(
+        adapter, "_release_for_retry", lambda received: retried.append(received)
+    )
+    asyncio.run(
+        adapter.on_processing_complete(event, adapter_module.ProcessingOutcome.FAILURE)
+    )
+    assert retried == [delivery]
+
+    empty_event = SimpleNamespace(
+        raw_message=None,
+        source=SimpleNamespace(
+            chat_id="person@example.com", thread_id="email_pp:thread"
+        ),
+        message_id=None,
+    )
+    asyncio.run(
+        adapter.on_processing_complete(
+            empty_event, adapter_module.ProcessingOutcome.SUCCESS
+        )
+    )
+
+    unknown_delivery = adapter_module._InboundMail(b"raw", b"4", None)
+    unknown_event = SimpleNamespace(
+        raw_message=unknown_delivery,
+        source=SimpleNamespace(
+            chat_id="person@example.com", thread_id="email_pp:thread"
+        ),
+        message_id="<unknown@example.com>",
+    )
+    adapter._response_deliveries.add(("person@example.com", "<unknown@example.com>"))
+    asyncio.run(
+        adapter.on_processing_complete(
+            unknown_event, adapter_module.ProcessingOutcome.SUCCESS
+        )
+    )
+
+
+def test_pending_deletion_storage_rejects_invalid_records_and_cleans_up_errors(
+    adapter, monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setattr(adapter_module, "active_profile_home", lambda: tmp_path)
+    assert adapter._load_pending_deletions() == set()
+    adapter._save_pending_deletions()
+
+    adapter._delete_processed = True
+    path = adapter._deletion_store_path
+    assert adapter._load_pending_deletions() == set()
+    path.parent.mkdir(parents=True)
+    path.write_text("{}")
+    monkeypatch.setattr(
+        adapter_module.json,
+        "load",
+        lambda _: {
+            adapter._deletion_store_key: [
+                ["1"],
+                [1, 2],
+                ["\u00e9", "3"],
+                ["1", "bad"],
+                ["1", "4"],
+            ]
+        },
+    )
+    assert adapter._load_pending_deletions() == {(b"1", b"4")}
+    monkeypatch.setattr(
+        adapter_module.json,
+        "load",
+        lambda _: {adapter._deletion_store_key: "invalid"},
+    )
+    assert adapter._load_pending_deletions() == set()
+    adapter._pending_deletions = {(b"1", b"4")}
+    monkeypatch.setattr(adapter_module.json, "load", lambda _: [])
+    adapter._save_pending_deletions()
+
+    monkeypatch.setattr(
+        adapter_module.os, "replace", lambda *_: (_ for _ in ()).throw(OSError())
+    )
+    monkeypatch.setattr(
+        adapter_module.os, "unlink", lambda *_: (_ for _ in ()).throw(OSError())
+    )
+    with pytest.raises(OSError):
+        adapter._save_pending_deletions()
+
+
+def test_processed_mail_failure_paths_are_non_destructive(
+    adapter, monkeypatch, tmp_path
+) -> None:
+    imap = IMAP()
+    monkeypatch.setattr(adapter_module, "active_profile_home", lambda: tmp_path)
+    monkeypatch.setattr(
+        adapter_module.imaplib, "IMAP4_SSL", lambda *args, **kwargs: imap
+    )
+    adapter._delete_processed = True
+    adapter._pending_deletions = {(b"old", b"3")}
+    adapter._retry_pending_deletions()
+    assert adapter._pending_deletions == set()
+
+    adapter._pending_deletions = {(b"1", b"3")}
+    imap.responses["store"] = ("OK", [])
+    imap.responses["expunge"] = ("NO", [])
+    adapter._retry_pending_deletions()
+    assert adapter._pending_deletions == {(b"1", b"3")}
+
+    imap.response = lambda _: ("UIDVALIDITY", [])
+    adapter._retry_pending_deletions()
+    assert adapter._pending_deletions == {(b"1", b"3")}
+    with pytest.raises(adapter_module.imaplib.IMAP4.error, match="UIDVALIDITY"):
+        adapter._fetch_unseen()
+    adapter._remember_processed_delivery(
+        adapter_module._InboundMail(b"raw", b"5", None)
+    )
+    adapter._remember_processed_delivery(
+        adapter_module._InboundMail(b"raw", b"6", b"1")
+    )
+
+    adapter._seen = {b"5"}
+    adapter._release_for_retry(adapter_module._InboundMail(b"raw", b"5", b"1"))
+    assert adapter._seen == set()
+    adapter._mark_seen(adapter_module._InboundMail(b"raw", b"5", b"1"))
+    imap.response = lambda _: ("UIDVALIDITY", [b"1"])
+    imap.responses["store"] = ("NO", [])
+    adapter._mark_seen(adapter_module._InboundMail(b"raw", b"5", b"1"))
+
+    class BrokenCapability:
+        def capability(self) -> tuple[str, list[bytes]]:
+            raise adapter_module.imaplib.IMAP4.error("broken")
+
+    assert not adapter_module.EmailPPAdapter._has_uidplus(BrokenCapability())
+
+
+def test_processed_delivery_serialization_and_terminal_message_handling(
+    adapter, monkeypatch
+) -> None:
+    adapter._delete_processed = True
+    handled: list[object] = []
+    seen: list[adapter_module._InboundMail] = []
+    remembered: list[adapter_module._InboundMail] = []
+
+    async def handle(event: object) -> None:
+        handled.append(event)
+
+    monkeypatch.setattr(adapter, "handle_message", handle)
+    monkeypatch.setattr(adapter, "_mark_seen", lambda delivery: seen.append(delivery))
+    monkeypatch.setattr(
+        adapter,
+        "_remember_processed_delivery",
+        lambda delivery: remembered.append(delivery),
+    )
+    first = SimpleNamespace(source=SimpleNamespace(thread_id="thread"))
+    second = SimpleNamespace(source=SimpleNamespace(thread_id="thread"))
+
+    async def serialize() -> None:
+        await adapter._queue_delivery(first)
+        await adapter._queue_delivery(second)
+        adapter._start_next_delivery("thread")
+        await asyncio.sleep(0)
+        adapter._start_next_delivery("thread")
+
+    asyncio.run(serialize())
+    assert handled == [first, second]
+    assert not adapter._active_delivery_threads
+
+    adapter._allowed = {"person@example.com"}
+    normal = adapter_module._InboundMail(
+        b"From: person@example.com\nMessage-ID: <inbound@example.com>\n\nhello",
+        b"6",
+        b"1",
+    )
+    asyncio.run(adapter._dispatch(normal))
+    assert (
+        adapter._inbound_deliveries[("person@example.com", "<inbound@example.com>")]
+        == normal
+    )
+
+    malformed = adapter_module._InboundMail(
+        b"From: person@example.com\n\nhello", b"7", b"1"
+    )
+    asyncio.run(adapter._dispatch(malformed))
+    assert seen == [malformed]
+
+    unsafe = adapter_module._InboundMail(
+        b"From: person@example.com\nSubject: Fwd\n\n"
+        b"---------- Forwarded message ---------\ninvalid",
+        b"8",
+        b"1",
+    )
+
+    async def sent_notice(*args: object) -> bool:
+        return True
+
+    monkeypatch.setattr(adapter, "_send_unsafe_forward_notice", sent_notice)
+    asyncio.run(adapter._dispatch(unsafe))
+    assert remembered == [unsafe]
+
+    async def unsent_notice(*args: object) -> bool:
+        return False
+
+    monkeypatch.setattr(adapter, "_send_unsafe_forward_notice", unsent_notice)
+    asyncio.run(adapter._dispatch(unsafe))
+    assert seen == [malformed, unsafe]
 
 
 def test_cold_start_history_modes_batches_and_uidvalidity(adapter, monkeypatch) -> None:
@@ -340,7 +645,9 @@ def test_cold_start_history_modes_batches_and_uidvalidity(adapter, monkeypatch) 
     )
     assert len(adapter._fetch_unseen()) == 3
     imap.uidvalidity = b"2"
-    assert adapter._fetch_unseen() == 3 * [b"From: person@example.com\n\nhello"]
+    assert [delivery.raw for delivery in adapter._fetch_unseen()] == 3 * [
+        b"From: person@example.com\n\nhello"
+    ]
 
 
 def test_imap_polling_rejects_malformed_responses_and_bounds_work(

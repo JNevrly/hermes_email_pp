@@ -1,7 +1,7 @@
 name: email-pp
 label: Email++
 kind: platform
-version: 0.3.4
+version: 0.4.0
 description: IMAP and SMTP gateway adapter with per-thread email routing.
 author: Josef Nevrly
 requires_env:
@@ -39,3 +39,5 @@ optional_env:
     description: "Enter always, forwarded, or never. Default always."
   - name: EMAIL_PP_PROCESS_HISTORY_WINDOW
     description: "Unread cold-start recovery in seconds: 0 skips existing mail, -1 processes all, positive values process only recent mail. Default: 0."
+  - name: EMAIL_PP_DELETE_PROCESSED
+    description: "Enter true to delete authorized email only after Hermes completes and its reply is accepted by SMTP. Default: false."
