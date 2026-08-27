@@ -716,6 +716,14 @@ def test_connect_disconnect_and_transport_failures(adapter, monkeypatch) -> None
             "FW: Proposal",
             "Proposal",
         ),
+        (
+            "Summarize this.\n" + "_" * 32 + "\n"
+            "From: Client <client@example.com>\nSent: Monday\n"
+            "To: Agent <agent@example.com>\nSubject: O365 proposal\n"
+            "\nOriginal O365 proposal.",
+            "FW: O365 proposal",
+            "O365 proposal",
+        ),
     ],
 )
 def test_forwarded_messages_create_fresh_private_review_drafts(
@@ -743,14 +751,20 @@ def test_forwarded_messages_create_fresh_private_review_drafts(
     assert (
         "Original request." in handled[0].text
         or "Original proposal." in handled[0].text
+        or "Original O365 proposal." in handled[0].text
     )
     draft_context = adapter._router.context["email_pp:thread"]["draft_context"]
-    assert draft_context["task_prompt"] in {"Review this.", "Please reply."}
+    assert draft_context["task_prompt"] in {
+        "Review this.",
+        "Please reply.",
+        "Summarize this.",
+    }
     assert draft_context["original_sender"] == "Client <client@example.com>"
     assert draft_context["original_subject"] == original_subject
     assert draft_context["original_body"] in {
         "Original request.",
         "Original proposal.",
+        "Original O365 proposal.",
     }
     result = asyncio.run(
         adapter.send("person@example.com", "Hermes response", "<wrapper@example.com>")
@@ -766,9 +780,18 @@ def test_forwarded_messages_create_fresh_private_review_drafts(
     plain_body = plain.get_payload(decode=True).decode()
     html_body = rich.get_payload(decode=True).decode()
     assert "Hermes response" in plain_body
-    assert "Original request." in plain_body or "Original proposal." in plain_body
-    assert "Review this." not in plain_body and "Please reply." not in plain_body
-    assert "Review this." not in html_body and "Please reply." not in html_body
+    assert any(
+        original in plain_body
+        for original in (
+            "Original request.",
+            "Original proposal.",
+            "Original O365 proposal.",
+        )
+    )
+    assert all(
+        prompt not in plain_body and prompt not in html_body
+        for prompt in ("Review this.", "Please reply.", "Summarize this.")
+    )
     assert ("person@example.com", result.message_id) in adapter._routes
 
     revision = EmailMessage()
@@ -822,11 +845,85 @@ def test_html_only_forward_and_ambiguous_forward_fail_closed(
     notice = smtp.sent.get_payload()[0].get_content()
     assert "could not safely identify" in notice
     assert "---------- Forwarded message" not in notice
+    nested = EmailMessage()
+    nested["From"] = "person@example.com"
+    nested["Subject"] = "FW: Nested"
+    nested["Message-ID"] = "<nested@example.com>"
+    nested.set_content(
+        "Summarize this.\n" + "_" * 32 + "\n"
+        "From: client@example.com\nSubject: Outer\n\nOuter body\n"
+        "---------- Forwarded message ---------\nFrom: nested@example.com\n"
+        "Subject: Nested\n\nNested body"
+    )
+    asyncio.run(adapter._dispatch(nested.as_bytes()))
+    assert len(handled) == 1
+    nested_notice = smtp.sent.get_payload()[0].get_content()
+    assert "could not safely identify" in nested_notice
+    assert "Outer body" not in nested_notice
     asyncio.run(
         adapter._send_unsafe_forward_notice(
             ThreadRoute("person@example.com", "email_pp:thread"), "invalid"
         )
     )
+
+
+def test_o365_html_forward_with_inline_image_creates_private_draft(
+    adapter, monkeypatch
+) -> None:
+    adapter._allow_all = True
+    smtp = SMTP()
+    monkeypatch.setattr(adapter, "_smtp", lambda: smtp)
+    handled: list[object] = []
+
+    async def handle(event: object) -> None:
+        handled.append(event)
+
+    monkeypatch.setattr(adapter, "handle_message", handle)
+    message = EmailMessage()
+    message["From"] = "person@example.com"
+    message["Subject"] = "FW: O365 HTML original"
+    message["Message-ID"] = "<o365-html-wrapper@example.com>"
+    message.set_content("This representation is intentionally empty.")
+    message.add_alternative(
+        "<html><head><title>IGNORED_TITLE</title><style>IGNORED_STYLE</style>"
+        "<script>IGNORED_SCRIPT</script></head><body><p>Draft a summary.</p><hr>"
+        '<div id="divRplyFwdMsg"><p><b>From:</b> Client &lt;client@example.com&gt;<br>'
+        "<p></p><b>Sent:</b> Monday<br><b>To:</b> Agent &lt;agent@example.com&gt;<br>"
+        "<b>Cc:</b> Copy &lt;copy@example.com&gt;<br>"
+        "<b>Subject:</b> O365 HTML original</p><p>Original HTML body.</p></div>"
+        "</body></html>",
+        subtype="html",
+    )
+    html = message.get_payload()[-1]
+    html.add_related(
+        b"png", maintype="image", subtype="png", cid="<image001.png@example.com>"
+    )
+
+    asyncio.run(adapter._dispatch(message.as_bytes()))
+
+    assert len(handled) == 1
+    assert "Draft a summary." in handled[0].text
+    assert "Original HTML body." in handled[0].text
+    assert "IGNORED_TITLE" not in handled[0].text
+    assert "IGNORED_STYLE" not in handled[0].text
+    assert "IGNORED_SCRIPT" not in handled[0].text
+    result = asyncio.run(
+        adapter.send(
+            "person@example.com", "Hermes response", "<o365-html-wrapper@example.com>"
+        )
+    )
+
+    assert result.success
+    draft = smtp.sent
+    assert draft["To"] == "person@example.com"
+    assert draft["Subject"] == "Draft: Re: O365 HTML original"
+    assert draft["In-Reply-To"] is None
+    assert draft["References"] is None
+    plain, rich = draft.get_payload()
+    plain_body = plain.get_payload(decode=True).decode()
+    html_body = rich.get_payload(decode=True).decode()
+    assert "Original HTML body." in plain_body and "Original HTML body." in html_body
+    assert "Draft a summary." not in plain_body and "Draft a summary." not in html_body
 
 
 def test_forwarding_parser_helpers_reject_ambiguous_candidates() -> None:
@@ -842,6 +939,7 @@ def test_forwarding_parser_helpers_reject_ambiguous_candidates() -> None:
     assert "Task" not in parsed.quote
     assert "Forwarded message reference data" in hermes_prompt(parsed)
     assert html_to_text("<div>one</div><br>two") == "one\n\ntwo"
+    assert "IGNORED" not in html_to_text("<style>IGNORED</style><p>Visible</p>")
     assert is_suspected_forward("normal", [gmail])
     assert is_suspected_forward("FW: original", ["normal"])
     assert not is_suspected_forward("normal", ["normal"])
@@ -870,6 +968,21 @@ def test_forwarding_parser_helpers_reject_ambiguous_candidates() -> None:
         parse_forward(
             "Task\n---------- Forwarded message ---------\n"
             "From: client@example.com\nSubject: Original\n\n"
+        )
+        is None
+    )
+    nested = (
+        "Task\n" + "_" * 32 + "\nFrom: client@example.com\n"
+        "Subject: Outer\n\nOuter body\n"
+        "---------- Forwarded message ---------\nFrom: nested@example.com\n"
+        "Subject: Nested\n\nNested body"
+    )
+    assert parse_forward(nested) is None
+    assert is_suspected_forward("FW: Outer", [nested])
+    assert (
+        parse_forward(
+            "Task\n" + "_" * 31 + "\nFrom: client@example.com\n"
+            "Subject: Original\n\nBody"
         )
         is None
     )

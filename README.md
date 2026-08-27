@@ -121,6 +121,13 @@ Email++ recognizes English inline forwards in these forms:
 -----Original Message-----
 ```
 
+```text
+________________________________
+```
+
+Outlook/O365 HTML forwards using an `hr` followed by the standard
+`divRplyFwdMsg` header block are also supported.
+
 Use a short task prompt before the boundary, followed by a complete forwarded
 message with at least `From`, `Subject`, and a non-empty body. The first Hermes
 response is sent to the forwarder as a separate email with subject

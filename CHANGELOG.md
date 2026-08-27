@@ -1,5 +1,9 @@
 # History
 
+## 0.3.2 (2026-08-27)
+
+* Support standard Outlook/O365 plain-text and HTML inline forwarded emails.
+
 ## 0.3.1 (2026-08-26)
 
 * Parse IMAP INTERNALDATE metadata returned after an RFC822 message literal.
