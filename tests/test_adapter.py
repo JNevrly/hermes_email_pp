@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
@@ -18,7 +19,10 @@ from hermes_email_pp.adapter import (
     ThreadRoute,
     _address,
     _decode,
+    _header_text,
     _message_ids,
+    _references_header,
+    _reply_thread_index,
 )
 from hermes_email_pp.forwarding import (
     hermes_prompt,
@@ -168,6 +172,36 @@ def test_header_helpers_are_safe() -> None:
         "<two@example.com>",
     ]
     assert _message_ids("<one@example.com>\nBcc: attacker@example.com") == []
+    assert _header_text("=?utf-8?q?caf=C3=A9?=") == "caf" + chr(0x00E9)
+    assert _header_text("topic\nBcc: attacker@example.com") == ""
+    assert _header_text(1) == ""
+    references = _references_header(
+        [
+            "<root@example.com>",
+            *[f"<{'x' * 80}{index}@example.com>" for index in range(30)],
+        ],
+        "<parent@example.com>",
+    )
+    assert references.startswith("<root@example.com>")
+    assert references.endswith("<parent@example.com>")
+    assert len(references) <= 900
+
+
+def test_outlook_thread_index_appends_a_compatible_response(monkeypatch) -> None:
+    parent = "Ad0Kk8lzyWeWmso4R3GZapkYRUL/2gPF/1bgAAjHEDAAAcQxMAUM+dCQAgSO1o4="
+    expected = (
+        "Ad0Kk8lzyWeWmso4R3GZapkYRUL/2gPF/1bgAAjHEDAAAcQxMAUM+dCQAgSO1o4AAAf9gA=="
+    )
+    monkeypatch.setattr(adapter_module.secrets, "randbits", lambda bits: 0x80)
+
+    reply = _reply_thread_index(
+        parent, datetime(2026, 8, 27, 12, 4, 29, tzinfo=timezone.utc)
+    )
+
+    assert reply == expected
+    assert base64.b64decode(reply).startswith(base64.b64decode(parent))
+    assert _reply_thread_index("not base64") is None
+    assert _reply_thread_index("AQ==") is None
 
 
 def test_platform_extra_accepts_an_allowed_user_list(adapter) -> None:
@@ -779,7 +813,7 @@ def test_forwarded_messages_create_fresh_private_review_drafts(
     assert result.success
     draft = smtp.sent
     assert draft["To"] == "person@example.com"
-    assert draft["Subject"] == f"Re: {original_subject}"
+    assert draft["Subject"] == f"Re: {subject}"
     assert draft["In-Reply-To"] == "<wrapper@example.com>"
     assert draft["References"] == (
         "<root@example.com> <previous@example.com> <wrapper@example.com>"
@@ -925,7 +959,7 @@ def test_o365_html_forward_with_inline_image_creates_private_draft(
     assert result.success
     draft = smtp.sent
     assert draft["To"] == "person@example.com"
-    assert draft["Subject"] == "Re: O365 HTML original"
+    assert draft["Subject"] == "Re: FW: O365 HTML original"
     assert draft["In-Reply-To"] == "<o365-html-wrapper@example.com>"
     assert draft["References"] == "<root@example.com> <o365-html-wrapper@example.com>"
     plain, rich = draft.get_payload()
@@ -933,6 +967,89 @@ def test_o365_html_forward_with_inline_image_creates_private_draft(
     html_body = rich.get_payload(decode=True).decode()
     assert "Original HTML body." in plain_body and "Original HTML body." in html_body
     assert "Draft a summary." not in plain_body and "Draft a summary." not in html_body
+
+
+def test_outlook_forward_reply_preserves_conversation_headers(
+    adapter, monkeypatch
+) -> None:
+    adapter._allow_all = True
+    smtp = SMTP()
+    monkeypatch.setattr(adapter, "_smtp", lambda: smtp)
+    parent_index = "Ad0Kk8lzyWeWmso4R3GZapkYRUL/2gPF/1bgAAjHEDAAAcQxMAUM+dCQAgSO1o4="
+    parent_id = (
+        "<TYYPR01MB13022B79D137FAC7115B12C88B3AD2@"
+        "TYYPR01MB13022.jpnprd01.prod.outlook.com>"
+    )
+    root_id = (
+        "<TY6PR01MB1732443F6D089B202C3CD704C84F42@"
+        "TY6PR01MB17324.jpnprd01.prod.outlook.com>"
+    )
+    message = EmailMessage(policy=adapter_module._SMTP_REPLY_POLICY)
+    message["From"] = "person@example.com"
+    message["Subject"] = "Fw: Wrapper topic"
+    message["Thread-Topic"] = "Fw: Wrapper topic"
+    message["Thread-Index"] = parent_index
+    message["Message-ID"] = parent_id
+    message["References"] = root_id
+    message.set_content(
+        "Write a reply.\n\n-----Original Message-----\n"
+        "From: Client <client@example.com>\nSubject: RE: Inline topic\n\nOriginal body."
+    )
+    monkeypatch.setattr(adapter_module.secrets, "randbits", lambda bits: 0x80)
+
+    async def handle(event: object) -> None:
+        return None
+
+    monkeypatch.setattr(adapter, "handle_message", handle)
+    asyncio.run(adapter._dispatch(message.as_bytes()))
+    result = asyncio.run(adapter.send("person@example.com", "Response", parent_id))
+
+    assert result.success
+    reply = smtp.sent
+    assert reply["Subject"] == "Re: Fw: Wrapper topic"
+    assert reply["In-Reply-To"] == parent_id
+    assert reply["References"] == f"{root_id} {parent_id}"
+    assert reply["Thread-Topic"] == "Fw: Wrapper topic"
+    reply_index = base64.b64decode(reply["Thread-Index"])
+    assert reply_index.startswith(base64.b64decode(parent_index))
+    assert len(reply_index) == len(base64.b64decode(parent_index)) + 5
+    headers = reply.as_bytes().split(b"\r\n\r\n", 1)[0]
+    assert b"In-Reply-To: =?" not in headers
+    assert b"References: =?" not in headers
+    assert parent_id.encode() in headers
+
+
+def test_malformed_outlook_conversation_headers_fall_back_to_rfc_reply(
+    adapter, monkeypatch
+) -> None:
+    adapter._allow_all = True
+    smtp = SMTP()
+    monkeypatch.setattr(adapter, "_smtp", lambda: smtp)
+    message = EmailMessage()
+    message["From"] = "person@example.com"
+    message["Subject"] = "Fwd: Wrapper topic"
+    message["Thread-Topic"] = "Wrapper topic"
+    message["Thread-Index"] = "not a conversation index"
+    message["Message-ID"] = "<wrapper@example.com>"
+    message.set_content(
+        "Write a reply.\n\n-----Original Message-----\n"
+        "From: Client <client@example.com>\nSubject: Inline topic\n\nOriginal body."
+    )
+
+    async def handle(event: object) -> None:
+        return None
+
+    monkeypatch.setattr(adapter, "handle_message", handle)
+    asyncio.run(adapter._dispatch(message.as_bytes()))
+    result = asyncio.run(
+        adapter.send("person@example.com", "Response", "<wrapper@example.com>")
+    )
+
+    assert result.success
+    assert smtp.sent["In-Reply-To"] == "<wrapper@example.com>"
+    assert smtp.sent["References"] == "<wrapper@example.com>"
+    assert smtp.sent["Thread-Topic"] is None
+    assert smtp.sent["Thread-Index"] is None
 
 
 def test_forwarding_parser_helpers_reject_ambiguous_candidates() -> None:

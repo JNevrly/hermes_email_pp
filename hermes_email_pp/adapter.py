@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import email
 import imaplib
 import logging
 import mimetypes
 import re
+import secrets
 import smtplib
 import ssl
 import uuid
@@ -51,6 +53,10 @@ _MESSAGE_ID = re.compile(r"<[^\s<>@]+@[^\s<>@]+>")
 _MESSAGE_IDS = re.compile(r"<[^\s<>@]+@[^\s<>@]+>(?:\s+<[^\s<>@]+@[^\s<>@]+>)*")
 _INTERNALDATE = re.compile(rb'INTERNALDATE "([^"]+)"')
 _POLL_BATCH_SIZE = 25
+_SMTP_REPLY_POLICY = SMTP.clone(max_line_length=998)
+_MAX_THREAD_INDEX_LEVELS = 100
+_MAX_REFERENCES_LENGTH = 900
+_FILETIME_EPOCH = datetime(1601, 1, 1, tzinfo=timezone.utc)
 logger = logging.getLogger(__name__)
 
 
@@ -92,6 +98,62 @@ def _message_ids(value: object) -> list[str]:
     if "\r" in value or "\n" in value:
         return []
     return _MESSAGE_ID.findall(value) if _MESSAGE_IDS.fullmatch(value.strip()) else []
+
+
+def _header_text(value: object) -> str:
+    """Return an unfolded display header while rejecting injected fields."""
+    if not isinstance(value, str):
+        return ""
+    value = re.sub(r"\r?\n[ \t]+", " ", value)
+    if "\r" in value or "\n" in value:
+        return ""
+    return _decode(value).strip()
+
+
+def _reply_thread_index(value: str, now: datetime | None = None) -> str | None:
+    """Append an Outlook-compatible response block to a conversation index."""
+    try:
+        raw = base64.b64decode("".join(value.split()), validate=True)
+    except (ValueError, UnicodeEncodeError):
+        return None
+    if (
+        len(raw) < 22
+        or (len(raw) - 22) % 5
+        or raw[0] != 1
+        or (len(raw) - 22) // 5 >= _MAX_THREAD_INDEX_LEVELS
+    ):
+        return None
+    anchor = int.from_bytes(raw[:6], "big") << 16
+    for offset in range(22, len(raw), 5):
+        block = int.from_bytes(raw[offset : offset + 4], "big")
+        anchor += (block & 0x7FFF_FFFF) << (23 if block >> 31 else 18)
+    reply_time = now or datetime.now(timezone.utc)
+    delta = reply_time.astimezone(timezone.utc) - _FILETIME_EPOCH
+    filetime = (delta.days * 86_400 + delta.seconds) * 10**7 + delta.microseconds * 10
+    difference = abs((filetime & ~0xFFFF) - anchor)
+    delta_code, shift = (0, 18) if difference < 1 << 49 else (1, 23)
+    response = (
+        ((delta_code << 31 | (difference >> shift) & 0x7FFF_FFFF) << 8)
+        | secrets.randbits(8)
+    ).to_bytes(5, "big")
+    return base64.b64encode(raw + response).decode("ascii")
+
+
+def _reply_subject(subject: str) -> str:
+    """Return one reply prefix while retaining a forwarding wrapper's topic."""
+    subject = re.sub(r"^(?:\s*re\s*:\s*)+", "", subject, flags=re.I).strip()
+    return f"Re: {subject}" if subject else "Re: Hermes Agent"
+
+
+def _references_header(references: list[str], reply_to: str) -> str:
+    """Retain the root and newest ancestors within one literal SMTP header line."""
+    identifiers = list(dict.fromkeys([*references, reply_to]))
+    selected = [identifiers[0]]
+    for identifier in reversed(identifiers[1:]):
+        if len(" ".join([identifier, *selected])) > _MAX_REFERENCES_LENGTH:
+            continue
+        selected.insert(1, identifier)
+    return " ".join(selected)
 
 
 def _display_name(value: str) -> str:
@@ -169,6 +231,7 @@ class EmailPPAdapter(BasePlatformAdapter):
         )
         self._poll_task: asyncio.Task[None] | None = None
         self._routes: dict[tuple[str, str], ThreadRoute] = {}
+        self._outlook_reply_context: dict[tuple[str, str], tuple[str, str]] = {}
         self._router = EmailThreadRouter()
 
     @staticmethod
@@ -497,6 +560,10 @@ class EmailPPAdapter(BasePlatformAdapter):
         message_id = message.get("Message-ID", "")
         if message_id:
             self._routes[(sender, message_id)] = route
+            self._outlook_reply_context[(sender, message_id)] = (
+                _header_text(message.get("Thread-Topic", "")),
+                _header_text(message.get("Thread-Index", "")),
+            )
         text, urls, types, message_type = self._content(message)
         alternatives = self._text_alternatives(message)
         subject = _decode(message.get("Subject", ""))
@@ -752,7 +819,13 @@ class EmailPPAdapter(BasePlatformAdapter):
             )
         try:
             message_id = await asyncio.to_thread(
-                self._send_email, route, content, reply_to or "", attachment, file_name
+                self._send_email,
+                route,
+                content,
+                reply_to or "",
+                attachment,
+                file_name,
+                self._outlook_reply_context.get((chat_id.lower(), reply_to or "")),
             )
             self._routes[(route.chat_id, message_id)] = route
             self._router.record_outbound(route, message_id)
@@ -782,6 +855,7 @@ class EmailPPAdapter(BasePlatformAdapter):
         reply_to: str,
         attachment: Path | None,
         file_name: str | None,
+        outlook_reply_context: tuple[str, str] | None = None,
     ) -> str:
         reply_ids = _message_ids(reply_to)
         if len(reply_ids) != 1:
@@ -796,19 +870,21 @@ class EmailPPAdapter(BasePlatformAdapter):
         fresh_draft = (
             draft.get("is_forwarded") == "true" and draft.get("draft_sent") == "false"
         )
-        if fresh_draft:
-            original_subject = str(draft.get("original_subject", "")).strip()
-            subject = f"Re: {original_subject or 'Hermes Agent'}"
-        elif not subject.lower().startswith("re:"):
-            subject = f"Re: {subject}" if subject else "Re: Hermes Agent"
+        subject = _reply_subject(subject)
         recipient_name = str(delivery.get("display_name", ""))
-        message = EmailMessage(policy=SMTP)
+        message = EmailMessage(policy=_SMTP_REPLY_POLICY)
         message["From"] = Address(display_name="Hermes Agent", addr_spec=self._address)
         message["To"] = Address(display_name=recipient_name, addr_spec=route.chat_id)
         message["Subject"] = subject
         message["In-Reply-To"] = reply_ids[0]
         references = _message_ids(str(quote_source.get("references", "")))
-        message["References"] = " ".join(dict.fromkeys([*references, reply_ids[0]]))
+        message["References"] = _references_header(references, reply_ids[0])
+        if outlook_reply_context is not None:
+            topic, parent_index = outlook_reply_context
+            reply_index = _reply_thread_index(parent_index)
+            if topic and reply_index is not None:
+                message["Thread-Topic"] = topic
+                message["Thread-Index"] = reply_index
         message["Date"] = formatdate(localtime=True)
         message_id = f"<hermes-{uuid.uuid4().hex}@{self._address.rsplit('@', 1)[-1]}>"
         message["Message-ID"] = message_id
