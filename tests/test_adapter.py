@@ -942,6 +942,40 @@ def test_authorization_mime_and_dispatch(adapter, monkeypatch) -> None:
     assert ("person@example.com", "<inbound@example.com>") in adapter._routes
 
 
+def test_reply_context_maps_are_lru_bounded_for_active_routes(
+    adapter, monkeypatch
+) -> None:
+    adapter._allow_all = True
+    assert adapter._route_cache_size == adapter_module.DEFAULT_MAX_THREADS
+    adapter._route_cache_size = 2
+    smtp = SMTP()
+    monkeypatch.setattr(adapter, "_smtp", lambda: smtp)
+
+    async def handle(event: object) -> None:
+        return None
+
+    monkeypatch.setattr(adapter, "handle_message", handle)
+    parent_index = "Ad0Kk8lzyWeWmso4R3GZapkYRUL/2gPF/1bgAAjHEDAAAcQxMAUM+dCQAgSO1o4="
+    for index in range(20):
+        message = EmailMessage()
+        message["From"] = "person@example.com"
+        message["Message-ID"] = f"<{index}@example.com>"
+        message["Thread-Topic"] = "Active project"
+        message["Thread-Index"] = parent_index
+        message.set_content("hello")
+        asyncio.run(adapter._dispatch(message.as_bytes()))
+
+    latest = "<19@example.com>"
+    assert len(adapter._routes) == len(adapter._outlook_reply_context) == 2
+    assert ("person@example.com", "<0@example.com>") not in adapter._routes
+    assert ("person@example.com", latest) in adapter._routes
+
+    result = asyncio.run(adapter.send("person@example.com", "reply", latest))
+
+    assert result.success
+    assert smtp.sent["Thread-Topic"] == "Active project"
+
+
 def test_attachment_cache_classifies_media_and_fails_closed_for_bad_images(
     adapter, monkeypatch, tmp_path
 ) -> None:

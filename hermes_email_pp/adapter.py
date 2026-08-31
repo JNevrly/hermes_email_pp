@@ -16,7 +16,7 @@ import smtplib
 import ssl
 import tempfile
 import uuid
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from email.header import decode_header
@@ -50,7 +50,12 @@ from .forwarding import (
     parse_forward,
 )
 from .rendering import quote_html, quote_plain, render_markdown
-from .threading import EmailThreadRouter, ThreadRoute, active_profile_home
+from .threading import (
+    DEFAULT_MAX_THREADS,
+    EmailThreadRouter,
+    ThreadRoute,
+    active_profile_home,
+)
 
 _AUTOMATED = ("noreply", "no-reply", "mailer-daemon", "postmaster", "bounce")
 _IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
@@ -249,8 +254,11 @@ class EmailPPAdapter(BasePlatformAdapter):
             seconds=max(0, self._process_history_window)
         )
         self._poll_task: asyncio.Task[None] | None = None
-        self._routes: dict[tuple[str, str], ThreadRoute] = {}
-        self._outlook_reply_context: dict[tuple[str, str], tuple[str, str]] = {}
+        self._route_cache_size = DEFAULT_MAX_THREADS
+        self._routes: OrderedDict[tuple[str, str], ThreadRoute] = OrderedDict()
+        self._outlook_reply_context: OrderedDict[tuple[str, str], tuple[str, str]] = (
+            OrderedDict()
+        )
         self._router = EmailThreadRouter()
         self._pending_deletions = self._load_pending_deletions()
         self._inbound_deliveries: dict[tuple[str, str], _InboundMail] = {}
@@ -750,6 +758,25 @@ class EmailPPAdapter(BasePlatformAdapter):
         if len(self._seen) > 2000:
             self._seen = set(sorted(self._seen, key=int)[-1000:])
 
+    def _remember_route(
+        self,
+        route: ThreadRoute,
+        message_id: str,
+        outlook_reply_context: tuple[str, str] | None = None,
+    ) -> None:
+        """Retain recent reply metadata using the router's active-thread bound."""
+        key = (route.chat_id, message_id)
+        self._routes[key] = route
+        self._routes.move_to_end(key)
+        while len(self._routes) > self._route_cache_size:
+            self._routes.popitem(last=False)
+        if outlook_reply_context is None:
+            return
+        self._outlook_reply_context[key] = outlook_reply_context
+        self._outlook_reply_context.move_to_end(key)
+        while len(self._outlook_reply_context) > self._route_cache_size:
+            self._outlook_reply_context.popitem(last=False)
+
     async def _dispatch(self, inbound: bytes | _InboundMail) -> None:
         """Build an event and retain its IMAP identity until terminal delivery."""
         delivery = inbound if isinstance(inbound, _InboundMail) else None
@@ -772,10 +799,13 @@ class EmailPPAdapter(BasePlatformAdapter):
         )
         message_id = message.get("Message-ID", "")
         if message_id:
-            self._routes[(sender, message_id)] = route
-            self._outlook_reply_context[(sender, message_id)] = (
-                _header_text(message.get("Thread-Topic", "")),
-                _header_text(message.get("Thread-Index", "")),
+            self._remember_route(
+                route,
+                message_id,
+                (
+                    _header_text(message.get("Thread-Topic", "")),
+                    _header_text(message.get("Thread-Index", "")),
+                ),
             )
         text, urls, types, message_type = self._content(message)
         alternatives = self._text_alternatives(message)
@@ -949,7 +979,7 @@ class EmailPPAdapter(BasePlatformAdapter):
         sent = await asyncio.to_thread(
             self._send_email, route, content, reply_ids[0], None, None
         )
-        self._routes[(route.chat_id, sent)] = route
+        self._remember_route(route, sent)
         self._router.record_outbound(route, sent)
         return True
 
@@ -1086,11 +1116,17 @@ class EmailPPAdapter(BasePlatformAdapter):
         attachment: Path | None,
         file_name: str | None = None,
     ) -> Any:
-        route = self._routes.get((chat_id.lower(), reply_to or ""))
+        key = (chat_id.lower(), reply_to or "")
+        route = self._routes.get(key)
+        if route is not None:
+            self._routes.move_to_end(key)
         if _address(chat_id) != chat_id.lower() or route is None:
             return SendResult(
                 success=False, error="explicit known recipient and reply route required"
             )
+        outlook_reply_context = self._outlook_reply_context.get(key)
+        if outlook_reply_context is not None:
+            self._outlook_reply_context.move_to_end(key)
         try:
             message_id = await asyncio.to_thread(
                 self._send_email,
@@ -1099,9 +1135,9 @@ class EmailPPAdapter(BasePlatformAdapter):
                 reply_to or "",
                 attachment,
                 file_name,
-                self._outlook_reply_context.get((chat_id.lower(), reply_to or "")),
+                outlook_reply_context,
             )
-            self._routes[(route.chat_id, message_id)] = route
+            self._remember_route(route, message_id)
             self._router.record_outbound(route, message_id)
             if reply_to:
                 self._response_deliveries.add((route.chat_id.lower(), reply_to))

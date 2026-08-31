@@ -19,7 +19,7 @@ _MESSAGE_ID = r"<[^\s<>@]+@[^\s<>@]+>"
 _MESSAGE_IDS = re.compile(rf"{_MESSAGE_ID}(?:\s+{_MESSAGE_ID})*")
 _INDIVIDUAL_MESSAGE_ID = re.compile(_MESSAGE_ID)
 _DEFAULT_RETENTION_DAYS = 90
-_DEFAULT_MAX_THREADS = 500
+DEFAULT_MAX_THREADS = 500
 
 
 @dataclass(frozen=True)
@@ -62,7 +62,7 @@ class EmailThreadRouter:
         profile_home: Path | None = None,
         *,
         retention_days: int = _DEFAULT_RETENTION_DAYS,
-        max_threads: int = _DEFAULT_MAX_THREADS,
+        max_threads: int = DEFAULT_MAX_THREADS,
     ) -> None:
         self._path = (
             (profile_home or active_profile_home()) / "email_pp" / "threads.json"
