@@ -66,6 +66,7 @@ _POLL_BATCH_SIZE = 25
 _SMTP_REPLY_POLICY = SMTP.clone(max_line_length=998)
 _MAX_THREAD_INDEX_LEVELS = 100
 _MAX_REFERENCES_LENGTH = 900
+_DELIVERY_COMPLETION_TIMEOUT = 600
 _FILETIME_EPOCH = datetime(1601, 1, 1, tzinfo=timezone.utc)
 logger = logging.getLogger(__name__)
 
@@ -265,6 +266,9 @@ class EmailPPAdapter(BasePlatformAdapter):
         self._response_deliveries: set[tuple[str, str]] = set()
         self._delivery_queues: dict[str, deque[MessageEvent]] = {}
         self._active_delivery_threads: set[str] = set()
+        self._active_deliveries: dict[str, MessageEvent] = {}
+        self._delivery_watchdogs: dict[str, asyncio.Task[None]] = {}
+        self._delivery_completion_timeout = _DELIVERY_COMPLETION_TIMEOUT
 
     @staticmethod
     def _setting(settings: dict[str, str], extra: Any, env: str, key: str) -> str:
@@ -879,11 +883,62 @@ class EmailPPAdapter(BasePlatformAdapter):
     async def _queue_delivery(self, event: MessageEvent) -> None:
         """Serialize mail per Hermes thread so completion maps to one UID."""
         thread_id = event.source.thread_id
-        if thread_id in self._active_delivery_threads:
-            self._delivery_queues.setdefault(thread_id, deque()).append(event)
+        if thread_id in self._active_deliveries:
+            queue = self._delivery_queues.setdefault(thread_id, deque())
+            queue.append(event)
+            logger.info(
+                "Email++ queued delivery behind active thread "
+                "(thread_id=%s, queue_size=%d)",
+                thread_id,
+                len(queue),
+            )
             return
-        self._active_delivery_threads.add(thread_id)
+        self._activate_delivery(event)
         await self.handle_message(event)
+
+    def _activate_delivery(self, event: MessageEvent) -> None:
+        """Track one delivery and arm its completion watchdog."""
+        thread_id = event.source.thread_id
+        self._active_delivery_threads.add(thread_id)
+        self._active_deliveries[thread_id] = event
+        watchdog = asyncio.create_task(self._watch_delivery(event))
+        self._delivery_watchdogs[thread_id] = watchdog
+        self._background_tasks.add(watchdog)
+        watchdog.add_done_callback(self._background_tasks.discard)
+
+    async def _watch_delivery(self, event: MessageEvent) -> None:
+        """Release a thread if Hermes never reports this delivery complete."""
+        try:
+            await asyncio.sleep(self._delivery_completion_timeout)
+        except asyncio.CancelledError:
+            raise
+        thread_id = event.source.thread_id
+        if self._active_deliveries.get(thread_id) is event:
+            logger.warning(
+                "Email++ delivery completion stalled; abandoning serialization guard "
+                "(thread_id=%s, timeout_seconds=%d)",
+                thread_id,
+                self._delivery_completion_timeout,
+            )
+            self._finish_delivery(event, abandoned=True)
+
+    def _finish_delivery(self, event: MessageEvent, *, abandoned: bool = False) -> None:
+        """Release only the active slot owned by this exact delivery."""
+        thread_id = event.source.thread_id
+        if self._active_deliveries.get(thread_id) is not event:
+            if not abandoned:
+                logger.warning(
+                    "Email++ ignored late processing completion for inactive delivery "
+                    "(thread_id=%s)",
+                    thread_id,
+                )
+            return
+        self._active_deliveries.pop(thread_id)
+        self._active_delivery_threads.discard(thread_id)
+        watchdog = self._delivery_watchdogs.pop(thread_id, None)
+        if watchdog is not None and watchdog is not asyncio.current_task():
+            watchdog.cancel()
+        self._start_next_delivery(thread_id)
 
     def _start_next_delivery(self, thread_id: str) -> None:
         """Schedule the next event after Hermes releases the current session guard."""
@@ -892,11 +947,17 @@ class EmailPPAdapter(BasePlatformAdapter):
             event = queue.popleft()
             if not queue:
                 self._delivery_queues.pop(thread_id, None)
+            self._activate_delivery(event)
+            logger.info(
+                "Email++ advancing delivery queue (thread_id=%s, remaining=%d)",
+                thread_id,
+                len(queue),
+            )
             task = asyncio.create_task(self.handle_message(event))
             self._background_tasks.add(task)
             task.add_done_callback(self._background_tasks.discard)
             return
-        self._active_delivery_threads.discard(thread_id)
+        logger.info("Email++ delivery queue drained (thread_id=%s)", thread_id)
 
     async def on_processing_complete(
         self, event: MessageEvent, outcome: ProcessingOutcome
@@ -922,7 +983,7 @@ class EmailPPAdapter(BasePlatformAdapter):
             else:
                 await asyncio.to_thread(self._release_for_retry, delivery)
         finally:
-            self._start_next_delivery(event.source.thread_id)
+            self._finish_delivery(event)
 
     @staticmethod
     def _text_alternatives(message: Any) -> list[str]:

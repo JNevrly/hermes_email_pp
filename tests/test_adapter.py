@@ -388,6 +388,8 @@ def test_completion_only_acknowledges_smtp_delivered_mail(adapter, monkeypatch) 
         lambda received: acknowledged.append(received),
     )
     monkeypatch.setattr(adapter, "_start_next_delivery", start_next)
+    adapter._active_deliveries[event.source.thread_id] = event
+    adapter._active_delivery_threads.add(event.source.thread_id)
 
     asyncio.run(
         adapter.on_processing_complete(event, adapter_module.ProcessingOutcome.SUCCESS)
@@ -551,9 +553,9 @@ def test_processed_delivery_serialization_and_terminal_message_handling(
     async def serialize() -> None:
         await adapter._queue_delivery(first)
         await adapter._queue_delivery(second)
-        adapter._start_next_delivery("thread")
+        adapter._finish_delivery(first)
         await asyncio.sleep(0)
-        adapter._start_next_delivery("thread")
+        adapter._finish_delivery(second)
 
     asyncio.run(serialize())
     assert handled == [first, second]
@@ -597,6 +599,86 @@ def test_processed_delivery_serialization_and_terminal_message_handling(
     monkeypatch.setattr(adapter, "_send_unsafe_forward_notice", unsent_notice)
     asyncio.run(adapter._dispatch(unsafe))
     assert seen == [malformed, unsafe]
+
+
+def test_delivery_watchdog_recovers_missing_and_late_completions(
+    adapter, monkeypatch, caplog
+) -> None:
+    adapter._delete_processed = True
+    adapter._delivery_completion_timeout = 0.01
+    handled: list[object] = []
+    acknowledged: list[adapter_module._InboundMail] = []
+    released: list[adapter_module._InboundMail] = []
+    second_started = asyncio.Event()
+    third_started = asyncio.Event()
+
+    async def handle(event: object) -> None:
+        handled.append(event)
+        if event is second:
+            second_started.set()
+        if event is third:
+            third_started.set()
+
+    monkeypatch.setattr(adapter, "handle_message", handle)
+    monkeypatch.setattr(
+        adapter,
+        "_remember_processed_delivery",
+        lambda delivery: acknowledged.append(delivery),
+    )
+    monkeypatch.setattr(
+        adapter, "_release_for_retry", lambda delivery: released.append(delivery)
+    )
+    first_delivery = adapter_module._InboundMail(b"first", b"1", b"1")
+    first = SimpleNamespace(
+        raw_message=first_delivery,
+        source=SimpleNamespace(
+            chat_id="person@example.com", thread_id="email_pp:thread"
+        ),
+        message_id="<first@example.com>",
+    )
+    second = SimpleNamespace(
+        raw_message=adapter_module._InboundMail(b"second", b"2", b"1"),
+        source=SimpleNamespace(
+            chat_id="person@example.com", thread_id="email_pp:thread"
+        ),
+        message_id="<second@example.com>",
+    )
+    third = SimpleNamespace(
+        raw_message=adapter_module._InboundMail(b"third", b"3", b"1"),
+        source=SimpleNamespace(
+            chat_id="person@example.com", thread_id="email_pp:thread"
+        ),
+        message_id="<third@example.com>",
+    )
+    adapter._response_deliveries.add(("person@example.com", "<first@example.com>"))
+    caplog.set_level(logging.INFO, logger=adapter_module.__name__)
+
+    async def recover() -> None:
+        await adapter._queue_delivery(first)
+        await adapter._queue_delivery(second)
+        await asyncio.wait_for(second_started.wait(), timeout=1)
+        await adapter._queue_delivery(third)
+        adapter._delivery_watchdogs["email_pp:thread"].cancel()
+        await adapter.on_processing_complete(
+            first, adapter_module.ProcessingOutcome.SUCCESS
+        )
+        assert adapter._active_deliveries["email_pp:thread"] is second
+        await adapter.on_processing_complete(
+            second, adapter_module.ProcessingOutcome.FAILURE
+        )
+        await asyncio.wait_for(third_started.wait(), timeout=1)
+        adapter._finish_delivery(third)
+
+    asyncio.run(recover())
+
+    assert handled == [first, second, third]
+    assert acknowledged == [first_delivery]
+    assert released == [second.raw_message]
+    assert not adapter._active_delivery_threads
+    assert "delivery completion stalled" in caplog.text
+    assert "advancing delivery queue" in caplog.text
+    assert "delivery queue drained" in caplog.text
+    assert "ignored late processing completion" in caplog.text
 
 
 def test_cold_start_history_modes_batches_and_uidvalidity(adapter, monkeypatch) -> None:
