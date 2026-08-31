@@ -1086,7 +1086,11 @@ class EmailPPAdapter(BasePlatformAdapter):
                     part.get_content_charset() or "utf-8", errors="replace"
                 )
             elif content_type == "text/html" and "attachment" not in disposition:
-                html = re.sub(r"<[^>]+>", "", payload.decode("utf-8", errors="replace"))
+                html = html_to_text(
+                    payload.decode(
+                        part.get_content_charset() or "utf-8", errors="replace"
+                    )
+                )
             elif "attachment" in disposition or part.get_filename():
                 path, attachment_type = self._cache_attachment(
                     payload, content_type, part.get_filename()

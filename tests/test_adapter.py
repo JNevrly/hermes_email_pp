@@ -1024,6 +1024,26 @@ def test_authorization_mime_and_dispatch(adapter, monkeypatch) -> None:
     assert ("person@example.com", "<inbound@example.com>") in adapter._routes
 
 
+def test_html_only_content_honors_charset_and_uses_shared_parser(adapter) -> None:
+    message = EmailMessage()
+    message.set_content(
+        "<p>Caf" + chr(0x00E9) + " &amp; tea</p>",
+        subtype="html",
+        charset="iso-8859-1",
+    )
+
+    text, urls, types, kind = adapter._content(message)
+
+    assert (
+        text
+        == adapter._text_alternatives(message)[0]
+        == "Caf" + chr(0x00E9) + " & tea\n\n"
+    )
+    assert urls == []
+    assert types == []
+    assert kind == adapter_module.MessageType.TEXT
+
+
 def test_reply_context_maps_are_lru_bounded_for_active_routes(
     adapter, monkeypatch
 ) -> None:
