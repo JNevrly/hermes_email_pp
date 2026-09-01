@@ -15,6 +15,7 @@ import secrets
 import smtplib
 import ssl
 import tempfile
+import threading
 import uuid
 from collections import OrderedDict, deque
 from dataclasses import dataclass
@@ -25,7 +26,7 @@ from email.message import EmailMessage
 from email.policy import SMTP
 from email.utils import formatdate, parseaddr, parsedate_to_datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from gateway.config import Platform  # type: ignore[import-not-found]
 from gateway.platforms.base import (  # type: ignore[import-not-found]
@@ -185,7 +186,7 @@ def _display_name(value: str) -> str:
 class EmailPPAdapter(BasePlatformAdapter):
     """Poll a TLS mailbox and deliver only explicitly routed email replies."""
 
-    _mailbox_states: dict[tuple[str, str], _MailboxState] = {}
+    _mailbox_states: dict[tuple[str, str, str, str], _MailboxState] = {}
 
     def __init__(self, config: Any) -> None:
         super().__init__(config, Platform("email_pp"))
@@ -254,6 +255,8 @@ class EmailPPAdapter(BasePlatformAdapter):
         self._history_cutoff = datetime.now(timezone.utc) - timedelta(
             seconds=max(0, self._process_history_window)
         )
+        self._imap: imaplib.IMAP4 | None = None
+        self._imap_lock = threading.Lock()
         self._poll_task: asyncio.Task[None] | None = None
         self._route_cache_size = DEFAULT_MAX_THREADS
         self._routes: OrderedDict[tuple[str, str], ThreadRoute] = OrderedDict()
@@ -313,6 +316,7 @@ class EmailPPAdapter(BasePlatformAdapter):
             await asyncio.to_thread(self._retry_pending_deletions)
         except (OSError, imaplib.IMAP4.error, smtplib.SMTPException):
             logger.warning("Email++ connection validation failed")
+            await asyncio.to_thread(self._close_imap_session)
             self._release_platform_lock()
             return False
         self._mark_connected()
@@ -330,14 +334,13 @@ class EmailPPAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 pass
             self._poll_task = None
+        await asyncio.to_thread(self._close_imap_session)
         self._release_platform_lock()
         self._mark_disconnected()
         logger.info("Email++ IMAP polling stopped")
 
     def _baseline_mailbox(self, is_reconnect: bool) -> None:
-        imap = imaplib.IMAP4_SSL(self._imap_host, self._imap_port, timeout=30)
-        try:
-            imap.login(self._address, self._password)
+        def baseline(imap: imaplib.IMAP4) -> None:
             uidvalidity = self._select_mailbox(imap)
             cached = self._mailbox_states.get(self._mailbox_key)
             if (
@@ -353,12 +356,17 @@ class EmailPPAdapter(BasePlatformAdapter):
                     "Email++ IMAP UIDVALIDITY changed; applying cold-start recovery"
                 )
             self._start_cold_mailbox(imap, uidvalidity)
-        finally:
-            self._close_imap(imap)
+
+        self._with_imap(baseline)
 
     @property
-    def _mailbox_key(self) -> tuple[str, str]:
-        return (self._address.lower(), self._mailbox)
+    def _mailbox_key(self) -> tuple[str, str, str, str]:
+        return (
+            self._address.lower(),
+            self._imap_host.lower(),
+            str(self._imap_port),
+            self._mailbox,
+        )
 
     @property
     def _deletion_store_key(self) -> str:
@@ -490,6 +498,40 @@ class EmailPPAdapter(BasePlatformAdapter):
             return None
         return values[0]
 
+    def _with_imap(self, operation: Callable[[imaplib.IMAP4], Any]) -> Any:
+        """Run one IMAP operation, reconnecting once after a broken session."""
+        with self._imap_lock:
+            for attempt in range(2):
+                try:
+                    return operation(self._get_imap())
+                except (OSError, imaplib.IMAP4.error):
+                    self._discard_imap()
+                    if attempt:
+                        raise
+        raise AssertionError("IMAP retry loop exited unexpectedly")
+
+    def _get_imap(self) -> imaplib.IMAP4:
+        if self._imap is None:
+            imap = imaplib.IMAP4_SSL(self._imap_host, self._imap_port, timeout=30)
+            try:
+                imap.login(self._address, self._password)
+            except BaseException:
+                self._close_imap(imap)
+                raise
+            self._imap = imap
+        return self._imap
+
+    def _discard_imap(self) -> None:
+        if self._imap is None:
+            return
+        imap, self._imap = self._imap, None
+        self._close_imap(imap)
+
+    def _close_imap_session(self) -> None:
+        """Wait for active workers before closing the shared IMAP connection."""
+        with self._imap_lock:
+            self._discard_imap()
+
     @staticmethod
     def _has_uidplus(imap: imaplib.IMAP4) -> bool:
         """Return whether targeted UID EXPUNGE is available on this server."""
@@ -510,10 +552,9 @@ class EmailPPAdapter(BasePlatformAdapter):
         """Retry recorded UID-targeted deletions without redispatching mail."""
         if not self._delete_processed or not self._pending_deletions:
             return
-        imap = imaplib.IMAP4_SSL(self._imap_host, self._imap_port, timeout=30)
-        changed = False
-        try:
-            imap.login(self._address, self._password)
+
+        def retry(imap: imaplib.IMAP4) -> None:
+            changed = False
             uidvalidity = self._select_mailbox(imap)
             if uidvalidity is None:
                 logger.warning("Email++ cannot delete mail without UIDVALIDITY")
@@ -529,6 +570,7 @@ class EmailPPAdapter(BasePlatformAdapter):
                     # UIDs may refer to unrelated mail after a UIDVALIDITY change.
                     self._pending_deletions.remove((expected_uidvalidity, uid))
                     changed = True
+                    self._save_pending_deletions()
                     logger.warning(
                         "Email++ discarded stale processed-mail deletion after "
                         "UIDVALIDITY changed"
@@ -546,11 +588,12 @@ class EmailPPAdapter(BasePlatformAdapter):
                     continue
                 self._pending_deletions.remove((expected_uidvalidity, uid))
                 changed = True
+                self._save_pending_deletions()
                 logger.info("Email++ deleted successfully processed mail")
-        finally:
-            self._close_imap(imap)
             if changed:
                 self._save_pending_deletions()
+
+        self._with_imap(retry)
 
     def _remember_processed_delivery(self, delivery: _InboundMail) -> None:
         """Persist a successful response before attempting destructive cleanup."""
@@ -563,9 +606,8 @@ class EmailPPAdapter(BasePlatformAdapter):
 
     def _mark_seen(self, delivery: _InboundMail) -> None:
         """Retain terminal rejected mail without repeatedly evaluating it."""
-        imap = imaplib.IMAP4_SSL(self._imap_host, self._imap_port, timeout=30)
-        try:
-            imap.login(self._address, self._password)
+
+        def mark_seen(imap: imaplib.IMAP4) -> None:
             if self._select_mailbox(imap) != delivery.uidvalidity:
                 logger.warning("Email++ did not mark stale rejected mail as seen")
                 return
@@ -574,8 +616,8 @@ class EmailPPAdapter(BasePlatformAdapter):
             )
             if status != "OK":
                 logger.warning("Email++ could not mark rejected mail as seen")
-        finally:
-            self._close_imap(imap)
+
+        self._with_imap(mark_seen)
 
     def _release_for_retry(self, delivery: _InboundMail) -> None:
         """Make a failed non-destructive delivery eligible for a later poll."""
@@ -650,65 +692,62 @@ class EmailPPAdapter(BasePlatformAdapter):
             await asyncio.sleep(max(1, self._poll_interval))
 
     def _fetch_unseen(self) -> list[_InboundMail]:
-        imap = imaplib.IMAP4_SSL(self._imap_host, self._imap_port, timeout=30)
+        return self._with_imap(self._fetch_unseen_from_imap)
+
+    def _fetch_unseen_from_imap(self, imap: imaplib.IMAP4) -> list[_InboundMail]:
         messages: list[_InboundMail] = []
-        try:
-            imap.login(self._address, self._password)
-            uidvalidity = self._select_mailbox(imap)
-            if self._delete_processed and uidvalidity is None:
-                raise imaplib.IMAP4.error("IMAP UIDVALIDITY is required for deletion")
-            if uidvalidity != self._uidvalidity:
-                logger.warning("Email++ IMAP UIDVALIDITY changed during polling")
-                self._start_cold_mailbox(imap, uidvalidity)
-            attempts = 0
-            for uid in sorted(
-                self._search_uids(
-                    imap, "UNSEEN UNDELETED" if self._delete_processed else "UNSEEN"
-                ),
-                key=self._uid_sort_key,
+        uidvalidity = self._select_mailbox(imap)
+        if self._delete_processed and uidvalidity is None:
+            raise imaplib.IMAP4.error("IMAP UIDVALIDITY is required for deletion")
+        if uidvalidity != self._uidvalidity:
+            logger.warning("Email++ IMAP UIDVALIDITY changed during polling")
+            self._start_cold_mailbox(imap, uidvalidity)
+        seen = set(self._seen)
+        attempts = 0
+        for uid in sorted(
+            self._search_uids(
+                imap, "UNSEEN UNDELETED" if self._delete_processed else "UNSEEN"
+            ),
+            key=self._uid_sort_key,
+        ):
+            if uid in seen:
+                continue
+            uid_number = self._uid_number(uid)
+            if uid_number is None:
+                continue
+            if uid_number <= self._baseline_uid and self._process_history_window == 0:
+                continue
+            if attempts >= _POLL_BATCH_SIZE:
+                break
+            attempts += 1
+            fetched = self._fetch_message(imap, uid, peek=self._delete_processed)
+            if fetched is None:
+                continue
+            raw, internaldate = fetched
+            if (
+                uid_number <= self._baseline_uid
+                and self._process_history_window > 0
+                and (internaldate is None or internaldate <= self._history_cutoff)
             ):
-                if uid in self._seen:
-                    continue
-                uid_number = self._uid_number(uid)
-                if uid_number is None:
-                    continue
-                if (
-                    uid_number <= self._baseline_uid
-                    and self._process_history_window == 0
-                ):
-                    continue
-                if attempts >= _POLL_BATCH_SIZE:
-                    break
-                attempts += 1
-                fetched = self._fetch_message(imap, uid, peek=self._delete_processed)
-                if fetched is None:
-                    continue
-                raw, internaldate = fetched
-                if (
-                    uid_number <= self._baseline_uid
-                    and self._process_history_window > 0
-                    and (internaldate is None or internaldate <= self._history_cutoff)
-                ):
-                    if internaldate is None:
-                        logger.warning(
-                            "Email++ IMAP skipped unread history with malformed "
-                            "INTERNALDATE"
-                        )
-                    self._seen.add(uid)
-                    continue
-                self._seen.add(uid)
-                messages.append(_InboundMail(raw, uid, uidvalidity))
-            self._trim_seen()
-            self._save_mailbox_state()
-            if attempts:
-                logger.info(
-                    "Email++ IMAP completed poll batch (fetched=%d, attempted=%d)",
-                    len(messages),
-                    attempts,
-                )
-            return messages
-        finally:
-            self._close_imap(imap)
+                if internaldate is None:
+                    logger.warning(
+                        "Email++ IMAP skipped unread history with malformed "
+                        "INTERNALDATE"
+                    )
+                seen.add(uid)
+                continue
+            seen.add(uid)
+            messages.append(_InboundMail(raw, uid, uidvalidity))
+        self._seen = seen
+        self._trim_seen()
+        self._save_mailbox_state()
+        if attempts:
+            logger.info(
+                "Email++ IMAP completed poll batch (fetched=%d, attempted=%d)",
+                len(messages),
+                attempts,
+            )
+        return messages
 
     @staticmethod
     def _uid_sort_key(uid: bytes) -> int:
@@ -1277,6 +1316,8 @@ class EmailPPAdapter(BasePlatformAdapter):
                 subtype=subtype,
                 filename=file_name or attachment.name,
             )
+        # SMTP DATA may have succeeded even if its response is lost, so keep sends
+        # isolated rather than retrying or reusing a session with ambiguous state.
         smtp = self._smtp()
         try:
             smtp.login(self._address, self._password)

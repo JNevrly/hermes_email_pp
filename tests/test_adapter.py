@@ -234,7 +234,7 @@ def test_tls_baseline_fetch_and_reconnect(adapter, monkeypatch) -> None:
     monkeypatch.setattr(adapter_module.imaplib, "IMAP4_SSL", build_imap)
     adapter._baseline_mailbox(False)
     assert adapter._baseline_uid == 2
-    assert instances[0].logged_out
+    assert not instances[0].logged_out
     assert instances[0].calls == [("search", (None, "ALL"))]
     assert instances[0].uid("search", "", "UNSEEN") == ("OK", [b""])
     adapter._baseline_mailbox(True)
@@ -242,12 +242,15 @@ def test_tls_baseline_fetch_and_reconnect(adapter, monkeypatch) -> None:
     assert [delivery.raw for delivery in adapter._fetch_unseen()] == 2 * [
         b"From: person@example.com\n\nhello"
     ]
-    assert instances[-1].calls[0] == ("search", (None, "UNSEEN"))
+    assert ("search", (None, "UNSEEN")) in instances[0].calls
+    assert len(instances) == 1
     adapter._seen = {str(value).encode() for value in range(2001)}
     adapter._trim_seen()
     assert len(adapter._seen) == 1000
     no_messages = IMAP()
     no_messages.responses["UNSEEN"] = ("NO", [])
+    adapter._close_imap_session()
+    assert instances[0].logged_out
     monkeypatch.setattr(
         adapter_module.imaplib, "IMAP4_SSL", lambda *args, **kwargs: no_messages
     )
@@ -267,6 +270,80 @@ def test_tls_baseline_fetch_and_reconnect(adapter, monkeypatch) -> None:
             raise OSError("also broken")
 
     adapter._close_imap(BrokenIMAP())
+
+
+def test_imap_reconnect_reuses_state_without_duplicate_fetches(
+    adapter, monkeypatch
+) -> None:
+    instances: list[IMAP] = []
+
+    class FailingIMAP(IMAP):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__(*args, **kwargs)
+            self.fail_search = False
+
+        def uid(self, command: str, *args: object):
+            if command == "search" and self.fail_search:
+                self.fail_search = False
+                raise OSError("connection reset")
+            return super().uid(command, *args)
+
+    def build_imap(*args: object, **kwargs: object) -> FailingIMAP:
+        instance = FailingIMAP(*args, **kwargs)
+        instances.append(instance)
+        return instance
+
+    monkeypatch.setattr(adapter_module.imaplib, "IMAP4_SSL", build_imap)
+    adapter._baseline_mailbox(False)
+    first = adapter._fetch_unseen()
+
+    assert [delivery.uid for delivery in first] == [b"3", b"4"]
+    assert adapter._seen == {b"3", b"4"}
+    assert adapter._uidvalidity == b"1"
+
+    instances[0].fail_search = True
+    assert adapter._fetch_unseen() == []
+
+    assert len(instances) == 2
+    assert instances[0].logged_out
+    assert not instances[1].logged_out
+    assert adapter._seen == {b"3", b"4"}
+    assert adapter._uidvalidity == b"1"
+
+    adapter._close_imap_session()
+    assert instances[1].logged_out
+
+
+def test_imap_reconnect_retries_a_partial_poll_without_losing_mail(
+    adapter, monkeypatch
+) -> None:
+    instances: list[IMAP] = []
+
+    class FailingIMAP(IMAP):
+        def __init__(self, fail_fetch: bool, *args: object, **kwargs: object) -> None:
+            super().__init__(*args, **kwargs)
+            self.fail_fetch = fail_fetch
+
+        def uid(self, command: str, *args: object):
+            if command == "fetch" and args[0] == "4" and self.fail_fetch:
+                self.fail_fetch = False
+                raise OSError("connection reset")
+            return super().uid(command, *args)
+
+    def build_imap(*args: object, **kwargs: object) -> FailingIMAP:
+        instance = FailingIMAP(not instances, *args, **kwargs)
+        instances.append(instance)
+        return instance
+
+    monkeypatch.setattr(adapter_module.imaplib, "IMAP4_SSL", build_imap)
+    adapter._baseline_mailbox(False)
+
+    deliveries = adapter._fetch_unseen()
+
+    assert [delivery.uid for delivery in deliveries] == [b"3", b"4"]
+    assert len(instances) == 2
+    assert instances[0].logged_out
+    assert adapter._seen == {b"3", b"4"}
 
 
 def test_imap_poll_logs_only_fetch_attempts(adapter, monkeypatch, caplog) -> None:
@@ -306,11 +383,16 @@ def test_processed_mail_deletion_is_uidplus_only_and_recovers(
     adapter, monkeypatch, tmp_path
 ) -> None:
     imap = IMAP()
+    connections = 0
+
+    def build_imap(*args: object, **kwargs: object) -> IMAP:
+        nonlocal connections
+        connections += 1
+        return imap
+
     imap.responses["UNSEEN UNDELETED"] = ("OK", [b"3"])
     monkeypatch.setattr(adapter_module, "active_profile_home", lambda: tmp_path)
-    monkeypatch.setattr(
-        adapter_module.imaplib, "IMAP4_SSL", lambda *args, **kwargs: imap
-    )
+    monkeypatch.setattr(adapter_module.imaplib, "IMAP4_SSL", build_imap)
     adapter._delete_processed = True
     adapter._pending_deletions = {(b"1", b"3")}
     adapter._save_pending_deletions()
@@ -336,6 +418,7 @@ def test_processed_mail_deletion_is_uidplus_only_and_recovers(
     assert deliveries[0].uidvalidity == b"1"
     assert ("search", (None, "UNSEEN UNDELETED")) in imap.calls
     assert ("fetch", ("3", "(BODY.PEEK[] INTERNALDATE)")) in imap.calls
+    assert connections == 1
 
 
 def test_processed_mail_requires_uidplus_and_keeps_rejected_mail(
