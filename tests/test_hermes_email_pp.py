@@ -29,6 +29,17 @@ from hermes_email_pp.config import (
 from hermes_email_pp.plugin import check_requirements, create_adapter, register
 from hermes_email_pp.threading import EmailThreadRouter, ThreadRoute
 
+_LOCAL_BUILD_ARTIFACTS = (
+    ".git",
+    ".release-venv",
+    ".venv",
+    "venv",
+    "ENV",
+    "build",
+    "dist",
+    "__pycache__",
+)
+
 
 class RecordingContext:
     """Minimal Hermes plugin context used to inspect registration arguments."""
@@ -91,10 +102,14 @@ def test_root_directory_plugin_manifest_and_loader() -> None:
                 sys.modules.pop(name, None)
 
 
-def test_repository_root_has_a_safe_hermes_plugin_scan() -> None:
+def test_repository_root_has_a_safe_hermes_plugin_scan(tmp_path) -> None:
     plugin_guard = pytest.importorskip("tools.plugin_guard")
+    plugin = tmp_path / "plugin"
+    shutil.copytree(
+        Path.cwd(), plugin, ignore=shutil.ignore_patterns(*_LOCAL_BUILD_ARTIFACTS)
+    )
 
-    result = plugin_guard.scan_plugin(Path.cwd(), source="JNevrly/hermes_email_pp")
+    result = plugin_guard.scan_plugin(plugin, source="JNevrly/hermes_email_pp")
 
     assert result.verdict == "safe"
     assert not {finding.severity for finding in result.findings} & {"critical", "high"}
@@ -107,7 +122,7 @@ def test_git_installer_accepts_the_directory_plugin(monkeypatch, tmp_path) -> No
     shutil.copytree(
         Path.cwd(),
         source,
-        ignore=shutil.ignore_patterns(".git", ".venv", "dist", "__pycache__"),
+        ignore=shutil.ignore_patterns(*_LOCAL_BUILD_ARTIFACTS),
     )
     subprocess.run(["git", "init", "--quiet", str(source)], check=True)
     subprocess.run(["git", "-C", str(source), "add", "."], check=True)

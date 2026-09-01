@@ -262,7 +262,6 @@ class EmailPPAdapter(BasePlatformAdapter):
         )
         self._router = EmailThreadRouter()
         self._pending_deletions = self._load_pending_deletions()
-        self._inbound_deliveries: dict[tuple[str, str], _InboundMail] = {}
         self._response_deliveries: set[tuple[str, str]] = set()
         self._delivery_queues: dict[str, deque[MessageEvent]] = {}
         self._active_delivery_threads: set[str] = set()
@@ -875,7 +874,6 @@ class EmailPPAdapter(BasePlatformAdapter):
             if event.message_id is None:
                 await asyncio.to_thread(self._mark_seen, delivery)
                 return
-            self._inbound_deliveries[(route.chat_id, event.message_id)] = delivery
             await self._queue_delivery(event)
             return
         await self.handle_message(event)
@@ -971,7 +969,6 @@ class EmailPPAdapter(BasePlatformAdapter):
         key = (event.source.chat_id.lower(), event.message_id or "")
         delivered = key in self._response_deliveries
         self._response_deliveries.discard(key)
-        self._inbound_deliveries.pop(key, None)
         try:
             if outcome is ProcessingOutcome.SUCCESS and delivered:
                 if delivery.uidvalidity is None:

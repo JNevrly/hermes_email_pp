@@ -44,9 +44,12 @@ dev = [
 ]
 
 [tool.coverage.run]
-omit = [".*", "*/site-packages/*"]
+omit = [".*", ".release-venv/*", ".venv/*", "*/site-packages/*"]
 source = ["hermes_email_pp"]
 relative_files = true
+
+[tool.pytest.ini_options]
+norecursedirs = [".release-venv", ".venv", "venv", "ENV", "build", "dist"]
 
 [tool.coverage.report]
 fail_under = 100

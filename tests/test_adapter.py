@@ -374,7 +374,6 @@ def test_completion_only_acknowledges_smtp_delivered_mail(adapter, monkeypatch) 
         message_id="<inbound@example.com>",
     )
     key = ("person@example.com", "<inbound@example.com>")
-    adapter._inbound_deliveries[key] = delivery
     adapter._response_deliveries.add(key)
     acknowledged: list[adapter_module._InboundMail] = []
     advanced: list[str] = []
@@ -397,7 +396,6 @@ def test_completion_only_acknowledges_smtp_delivered_mail(adapter, monkeypatch) 
 
     assert acknowledged == [delivery]
     assert advanced == ["email_pp:thread"]
-    assert key not in adapter._inbound_deliveries
 
     retried: list[adapter_module._InboundMail] = []
     monkeypatch.setattr(
@@ -407,6 +405,12 @@ def test_completion_only_acknowledges_smtp_delivered_mail(adapter, monkeypatch) 
         adapter.on_processing_complete(event, adapter_module.ProcessingOutcome.FAILURE)
     )
     assert retried == [delivery]
+    asyncio.run(
+        adapter.on_processing_complete(
+            event, adapter_module.ProcessingOutcome.CANCELLED
+        )
+    )
+    assert retried == [delivery, delivery]
 
     empty_event = SimpleNamespace(
         raw_message=None,
@@ -533,6 +537,7 @@ def test_processed_delivery_serialization_and_terminal_message_handling(
     adapter, monkeypatch
 ) -> None:
     adapter._delete_processed = True
+    assert not hasattr(adapter, "_inbound_deliveries")
     handled: list[object] = []
     seen: list[adapter_module._InboundMail] = []
     remembered: list[adapter_module._InboundMail] = []
@@ -568,10 +573,7 @@ def test_processed_delivery_serialization_and_terminal_message_handling(
         b"1",
     )
     asyncio.run(adapter._dispatch(normal))
-    assert (
-        adapter._inbound_deliveries[("person@example.com", "<inbound@example.com>")]
-        == normal
-    )
+    assert handled[-1].raw_message is normal
 
     malformed = adapter_module._InboundMail(
         b"From: person@example.com\n\nhello", b"7", b"1"
