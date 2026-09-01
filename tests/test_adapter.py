@@ -1109,6 +1109,36 @@ def test_authorization_mime_and_dispatch(adapter, monkeypatch) -> None:
     assert ("person@example.com", "<inbound@example.com>") in adapter._routes
 
 
+@pytest.mark.parametrize(
+    "sender",
+    [
+        "noreply@example.com",
+        "no-reply@example.com",
+        "mailer-daemon@example.com",
+        "postmaster@example.com",
+        "bounce@example.com",
+    ],
+)
+def test_automated_senders_are_rejected(adapter, sender) -> None:
+    adapter._allowed = {sender}
+
+    assert not adapter._permitted(sender, EmailMessage())
+
+
+@pytest.mark.parametrize(
+    "sender",
+    [
+        "bounceback@example.com",
+        "no-reply-team@example.com",
+        "person@bounce.example.com",
+    ],
+)
+def test_automated_sender_lookalikes_are_permitted(adapter, sender) -> None:
+    adapter._allowed = {sender}
+
+    assert adapter._permitted(sender, EmailMessage())
+
+
 def test_html_only_content_honors_charset_and_uses_shared_parser(adapter) -> None:
     message = EmailMessage()
     message.set_content(

@@ -1081,11 +1081,8 @@ class EmailPPAdapter(BasePlatformAdapter):
         return True
 
     def _permitted(self, sender: str, message: Any) -> bool:
-        if (
-            not sender
-            or sender == self._address.lower()
-            or any(x in sender for x in _AUTOMATED)
-        ):
+        local_part, _, _ = sender.partition("@")
+        if not sender or sender == self._address.lower() or local_part in _AUTOMATED:
             logger.debug(
                 "Email++ rejected inbound message: invalid or automated sender"
             )
