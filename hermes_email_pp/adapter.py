@@ -508,7 +508,7 @@ class EmailPPAdapter(BasePlatformAdapter):
                     self._discard_imap()
                     if attempt:
                         raise
-        raise AssertionError("IMAP retry loop exited unexpectedly")
+        raise AssertionError("IMAP retry loop exited unexpectedly")  # pragma: no cover
 
     def _get_imap(self) -> imaplib.IMAP4:
         if self._imap is None:

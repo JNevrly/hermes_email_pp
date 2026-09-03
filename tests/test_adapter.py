@@ -272,6 +272,23 @@ def test_tls_baseline_fetch_and_reconnect(adapter, monkeypatch) -> None:
     adapter._close_imap(BrokenIMAP())
 
 
+def test_imap_login_failure_closes_temporary_connection(adapter, monkeypatch) -> None:
+    class LoginFailingIMAP(IMAP):
+        def login(self, *args: object) -> None:
+            raise OSError("authentication failed")
+
+    imap = LoginFailingIMAP()
+    monkeypatch.setattr(
+        adapter_module.imaplib, "IMAP4_SSL", lambda *args, **kwargs: imap
+    )
+
+    with pytest.raises(OSError, match="authentication failed"):
+        adapter._get_imap()
+
+    assert imap.logged_out
+    assert adapter._imap is None
+
+
 def test_imap_reconnect_reuses_state_without_duplicate_fetches(
     adapter, monkeypatch
 ) -> None:
