@@ -1,5 +1,10 @@
 # History
 
+## 0.4.1 (2026-09-01)
+
+* Improve IMAP connection reliability, MIME charset handling, and email-thread recovery.
+* Reject automated senders more reliably.
+
 ## 0.4.0 (2026-08-27)
 
 * Add opt-in, UID-safe deletion of email after Hermes completes and SMTP accepts its reply.
