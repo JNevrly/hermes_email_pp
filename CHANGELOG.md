@@ -1,5 +1,10 @@
 # History
 
+## 0.5.0 (2026-09-04)
+
+* Support configurable sender names for outgoing replies.
+* Bundle generated assets into email responses with configurable attachment limits.
+
 ## 0.4.1 (2026-09-01)
 
 * Improve IMAP connection reliability, MIME charset handling, and email-thread recovery.
