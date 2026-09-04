@@ -148,6 +148,7 @@ def adapter(monkeypatch, tmp_path) -> EmailPPAdapter:
         "EMAIL_PP_PASSWORD",
         "EMAIL_PP_IMAP_HOST",
         "EMAIL_PP_SMTP_HOST",
+        "EMAIL_PP_SENDER_NAME",
         "EMAIL_PP_QUOTE_MODE",
         "EMAIL_PP_PROCESS_HISTORY_WINDOW",
     ):
@@ -1051,6 +1052,38 @@ print("code")
         "text/html",
     ]
     assert attachment_part.get_content_disposition() == "attachment"
+
+
+def test_outbound_sender_name_uses_configured_and_default_display_names(
+    adapter, monkeypatch
+) -> None:
+    smtp = SMTP()
+    monkeypatch.setattr(adapter, "_smtp", lambda: smtp)
+    route = ThreadRoute("person@example.com", "email_pp:thread")
+
+    adapter._send_email(route, "body", "<inbound@example.com>", None, None)
+
+    assert adapter._sender_name == "Hermes Agent"
+    assert smtp.sent["From"].addresses[0].display_name == "Hermes Agent"
+    assert smtp.sent["From"].addresses[0].addr_spec == "agent@example.com"
+
+    configured = EmailPPAdapter(
+        SimpleNamespace(
+            extra={
+                "address": "agent@example.com",
+                "password": "secret",
+                "imap_host": "imap.example.com",
+                "smtp_host": "smtp.example.com",
+                "sender_name": "Support Team",
+            }
+        )
+    )
+    monkeypatch.setattr(configured, "_smtp", lambda: smtp)
+    configured._send_email(route, "body", "<inbound@example.com>", None, None)
+
+    assert configured._sender_name == "Support Team"
+    assert smtp.sent["From"].addresses[0].display_name == "Support Team"
+    assert smtp.sent["From"].addresses[0].addr_spec == "agent@example.com"
 
 
 def test_quote_mode_defaults_validates_and_honors_forwarded_only(adapter) -> None:

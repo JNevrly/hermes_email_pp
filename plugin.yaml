@@ -25,6 +25,8 @@ optional_env:
     description: "IMAP-over-TLS port. Default: 993."
   - name: EMAIL_PP_SMTP_PORT
     description: "SMTP STARTTLS port; use 465 for implicit TLS. Default: 587."
+  - name: EMAIL_PP_SENDER_NAME
+    description: "Display name used for outgoing replies. Default: Hermes Agent."
   - name: EMAIL_PP_POLL_INTERVAL
     description: "Inbox polling interval in seconds. Default: 15."
   - name: EMAIL_PP_MAILBOX

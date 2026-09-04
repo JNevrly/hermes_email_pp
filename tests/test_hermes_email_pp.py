@@ -227,6 +227,8 @@ def test_channel_environment_metadata_covers_every_email_pp_setting() -> None:
     assert fields["EMAIL_PP_PASSWORD"]["password"] is True
     assert "Default: 993" in fields["EMAIL_PP_IMAP_PORT"]["description"]
     assert "WARNING" in fields["EMAIL_PP_ALLOW_ALL_USERS"]["description"]
+    assert fields["EMAIL_PP_SENDER_NAME"]["prompt"] == "Sender name"
+    assert "Default: Hermes Agent" in fields["EMAIL_PP_SENDER_NAME"]["description"]
     assert (
         "Default: true"
         in fields["EMAIL_PP_REQUIRE_AUTHENTICATED_SENDER"]["description"]
@@ -253,6 +255,7 @@ def test_configuration_accepts_email_pp_environment(monkeypatch) -> None:
     ):
         monkeypatch.setenv(name, value)
     monkeypatch.setenv("EMAIL_PP_IMAP_PORT", "993")
+    monkeypatch.setenv("EMAIL_PP_SENDER_NAME", "Support Team")
     monkeypatch.setenv("EMAIL_PP_QUOTE_MODE", "forwarded")
 
     assert is_configured(SimpleNamespace(extra={}))
@@ -262,6 +265,7 @@ def test_configuration_accepts_email_pp_environment(monkeypatch) -> None:
         "imap_host": "imap.example.com",
         "smtp_host": "smtp.example.com",
         "imap_port": "993",
+        "sender_name": "Support Team",
         "quote_mode": "forwarded",
     }
 

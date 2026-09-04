@@ -71,6 +71,7 @@ Email++ platform configuration.
 | `EMAIL_PP_SMTP_HOST` | Yes | - | SMTP server hostname. |
 | `EMAIL_PP_IMAP_PORT` | No | `993` | IMAP-over-TLS port. |
 | `EMAIL_PP_SMTP_PORT` | No | `587` | SMTP STARTTLS port; use `465` for implicit TLS. |
+| `EMAIL_PP_SENDER_NAME` | No | `Hermes Agent` | Display name used for outgoing replies; the mailbox address remains `EMAIL_PP_ADDRESS`. |
 | `EMAIL_PP_POLL_INTERVAL` | No | `15` | Inbox polling interval in seconds; values below one second are treated as one second. |
 | `EMAIL_PP_MAILBOX` | No | `INBOX` | Mailbox selected for polling. |
 | `EMAIL_PP_ALLOWED_USERS` | No | empty | Comma-separated sender-address allowlist. Required unless `EMAIL_PP_ALLOW_ALL_USERS` is enabled. |

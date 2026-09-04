@@ -16,6 +16,7 @@ REQUIRED_ENV = (
 OPTIONAL_ENV = (
     "EMAIL_PP_IMAP_PORT",
     "EMAIL_PP_SMTP_PORT",
+    "EMAIL_PP_SENDER_NAME",
     "EMAIL_PP_POLL_INTERVAL",
     "EMAIL_PP_MAILBOX",
     "EMAIL_PP_ALLOWED_USERS",
@@ -66,6 +67,11 @@ CHANNEL_ENV = (
         "prompt": "SMTP port",
         "description": "SMTP STARTTLS port; use 465 for implicit TLS. Default: 587.",
         "advanced": True,
+    },
+    {
+        "name": "EMAIL_PP_SENDER_NAME",
+        "prompt": "Sender name",
+        "description": "Display name used for outgoing replies. Default: Hermes Agent.",
     },
     {
         "name": "EMAIL_PP_POLL_INTERVAL",
@@ -155,6 +161,7 @@ _CONFIG_KEYS = {
     "EMAIL_PP_SMTP_HOST": "smtp_host",
     "EMAIL_PP_IMAP_PORT": "imap_port",
     "EMAIL_PP_SMTP_PORT": "smtp_port",
+    "EMAIL_PP_SENDER_NAME": "sender_name",
     "EMAIL_PP_POLL_INTERVAL": "poll_interval",
     "EMAIL_PP_MAILBOX": "mailbox",
     "EMAIL_PP_ALLOWED_USERS": "allowed_users",

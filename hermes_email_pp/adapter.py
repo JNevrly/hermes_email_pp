@@ -206,6 +206,10 @@ class EmailPPAdapter(BasePlatformAdapter):
         self._smtp_port = self._integer(
             settings, extra, "EMAIL_PP_SMTP_PORT", "smtp_port", 587
         )
+        self._sender_name = (
+            self._setting(settings, extra, "EMAIL_PP_SENDER_NAME", "sender_name")
+            or "Hermes Agent"
+        )
         self._poll_interval = self._integer(
             settings, extra, "EMAIL_PP_POLL_INTERVAL", "poll_interval", 15
         )
@@ -1283,7 +1287,9 @@ class EmailPPAdapter(BasePlatformAdapter):
         subject = _reply_subject(subject)
         recipient_name = str(delivery.get("display_name", ""))
         message = EmailMessage(policy=_SMTP_REPLY_POLICY)
-        message["From"] = Address(display_name="Hermes Agent", addr_spec=self._address)
+        message["From"] = Address(
+            display_name=self._sender_name, addr_spec=self._address
+        )
         message["To"] = Address(display_name=recipient_name, addr_spec=route.chat_id)
         message["Subject"] = subject
         message["In-Reply-To"] = reply_ids[0]
