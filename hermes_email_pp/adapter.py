@@ -40,9 +40,15 @@ from gateway.platforms.base import (  # type: ignore[import-not-found]
     cache_image_from_bytes,
     cache_video_from_bytes,
     validate_inbound_media_size,
+    validate_media_delivery_path,
 )
 
-from .config import delete_processed, environment_settings, process_history_window
+from .config import (
+    delete_processed,
+    environment_settings,
+    outbound_attachment_limit,
+    process_history_window,
+)
 from .forwarding import (
     ForwardedMessage,
     hermes_prompt,
@@ -69,6 +75,12 @@ _MAX_THREAD_INDEX_LEVELS = 100
 _MAX_REFERENCES_LENGTH = 900
 _DELIVERY_COMPLETION_TIMEOUT = 600
 _FILETIME_EPOCH = datetime(1601, 1, 1, tzinfo=timezone.utc)
+_ATTACHMENT_ENVELOPE_RE = re.compile(
+    r"\[\[email_pp_attachments:v1:([A-Za-z0-9_-]+)\]\]"
+)
+_UNRESOLVED_MEDIA_RE = re.compile(r"MEDIA:\s*[`\"']?(?:~/|/|[A-Za-z]:[/\\])")
+_MAX_ATTACHMENT_ENVELOPE_BYTES = 16 * 1024
+_MAX_ATTACHMENT_ENVELOPE_PATHS = 100
 logger = logging.getLogger(__name__)
 
 
@@ -88,6 +100,79 @@ class _InboundMail:
     raw: bytes
     uid: bytes
     uidvalidity: bytes | None
+
+
+@dataclass(frozen=True)
+class _AttachmentEnvelope:
+    """Validated attachment references carried through Hermes' text-only seam."""
+
+    paths: tuple[Path, ...]
+    invalid: bool = False
+
+
+@dataclass(frozen=True)
+class _PreparedAttachment:
+    """One attachment snapshotted before opening the SMTP transaction."""
+
+    data: bytes
+    maintype: str
+    subtype: str
+    filename: str
+
+
+def _encode_attachment_envelope(envelope: _AttachmentEnvelope) -> str:
+    """Encode bounded private metadata that never reaches the recipient body."""
+    payload = {
+        "paths": [str(path) for path in envelope.paths],
+        "invalid": envelope.invalid,
+    }
+    encoded = (
+        base64.urlsafe_b64encode(
+            json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        )
+        .decode("ascii")
+        .rstrip("=")
+    )
+    marker = f"[[email_pp_attachments:v1:{encoded}]]"
+    if len(marker.encode("utf-8")) > _MAX_ATTACHMENT_ENVELOPE_BYTES:
+        return _encode_attachment_envelope(_AttachmentEnvelope((), invalid=True))
+    return marker
+
+
+def _append_attachment_envelope(content: str, envelope: _AttachmentEnvelope) -> str:
+    marker = _encode_attachment_envelope(envelope)
+    return f"{content.rstrip()}\n{marker}" if content.strip() else marker
+
+
+def _decode_attachment_envelope(
+    content: str,
+) -> tuple[str, _AttachmentEnvelope | None]:
+    """Remove one final envelope marker, treating malformed metadata as failure."""
+    matches = list(_ATTACHMENT_ENVELOPE_RE.finditer(content))
+    if not matches:
+        return content, None
+    marker = matches[-1]
+    body = content[: marker.start()].rstrip()
+    if len(matches) != 1 or content[marker.end() :].strip():
+        return body, _AttachmentEnvelope((), invalid=True)
+    encoded = marker.group(1)
+    try:
+        raw = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+        if len(raw) > _MAX_ATTACHMENT_ENVELOPE_BYTES:
+            raise ValueError("attachment envelope is too large")
+        payload = json.loads(raw)
+        paths = payload["paths"]
+        invalid = payload["invalid"]
+        if (
+            not isinstance(paths, list)
+            or len(paths) > _MAX_ATTACHMENT_ENVELOPE_PATHS
+            or not isinstance(invalid, bool)
+            or not all(isinstance(path, str) and path for path in paths)
+        ):
+            raise ValueError("attachment envelope has invalid fields")
+    except (UnicodeDecodeError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        return body, _AttachmentEnvelope((), invalid=True)
+    return body, _AttachmentEnvelope(tuple(Path(path) for path in paths), invalid)
 
 
 def _decode(value: str) -> str:
@@ -186,6 +271,9 @@ def _display_name(value: str) -> str:
 class EmailPPAdapter(BasePlatformAdapter):
     """Poll a TLS mailbox and deliver only explicitly routed email replies."""
 
+    # SMTP cannot revise a message after acceptance. Hermes must wait for the
+    # complete response so the body and explicit MEDIA files share one message.
+    SUPPORTS_MESSAGE_EDITING = False
     _mailbox_states: dict[tuple[str, str, str, str], _MailboxState] = {}
 
     def __init__(self, config: Any) -> None:
@@ -252,6 +340,26 @@ class EmailPPAdapter(BasePlatformAdapter):
             self._setting(
                 settings, extra, "EMAIL_PP_DELETE_PROCESSED", "delete_processed"
             )
+        )
+        self._max_outbound_attachments = outbound_attachment_limit(
+            self._setting(
+                settings,
+                extra,
+                "EMAIL_PP_MAX_OUTBOUND_ATTACHMENTS",
+                "max_outbound_attachments",
+            ),
+            setting="EMAIL_PP_MAX_OUTBOUND_ATTACHMENTS",
+            default=10,
+        )
+        self._max_outbound_total_bytes = outbound_attachment_limit(
+            self._setting(
+                settings,
+                extra,
+                "EMAIL_PP_MAX_OUTBOUND_TOTAL_BYTES",
+                "max_outbound_total_bytes",
+            ),
+            setting="EMAIL_PP_MAX_OUTBOUND_TOTAL_BYTES",
+            default=15 * 1024 * 1024,
         )
         self._seen: set[bytes] = set()
         self._baseline_uid = 0
@@ -1160,6 +1268,42 @@ class EmailPPAdapter(BasePlatformAdapter):
             return cache_video_from_bytes(payload, suffix), MessageType.VIDEO
         return cache_document_from_bytes(payload, safe_name), MessageType.DOCUMENT
 
+    def extract_media(self, content: str) -> tuple[list[tuple[str, bool]], str]:
+        """Carry explicit MEDIA files to send() instead of Hermes' later media loop."""
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+        protected = BasePlatformAdapter._mask_protected_spans(cleaned)
+        protected = BasePlatformAdapter._mask_json_string_media(protected)
+        unresolved = bool(_UNRESOLVED_MEDIA_RE.search(protected))
+        if not media and not unresolved:
+            return [], cleaned
+        paths: list[Path] = []
+        seen: set[str] = set()
+        invalid = unresolved
+        for raw_path, _is_voice in media:
+            safe_path = validate_media_delivery_path(raw_path)
+            if safe_path is None:
+                invalid = True
+                continue
+            if safe_path not in seen:
+                seen.add(safe_path)
+                paths.append(Path(safe_path))
+        if len(paths) > self._max_outbound_attachments:
+            invalid = True
+        envelope = _AttachmentEnvelope(
+            tuple(paths[: self._max_outbound_attachments]), invalid=invalid
+        )
+        return [], _append_attachment_envelope(cleaned, envelope)
+
+    @staticmethod
+    def extract_local_files(content: str) -> tuple[list[str], str]:
+        """Keep local paths as useful email references unless MEDIA is explicit."""
+        return [], content
+
+    @staticmethod
+    def extract_images(content: str) -> tuple[list[tuple[str, str]], str]:
+        """Leave remote and localhost image references in the email body."""
+        return [], content
+
     async def send(
         self,
         chat_id: str,
@@ -1167,7 +1311,36 @@ class EmailPPAdapter(BasePlatformAdapter):
         reply_to: str | None = None,
         metadata: Any = None,
     ) -> Any:
-        return await self._send_parts(chat_id, content, reply_to, None)
+        body, envelope = _decode_attachment_envelope(content)
+        if envelope is None:
+            return await self._send_parts(chat_id, body, reply_to, ())
+        if envelope.invalid:
+            return await self._send_attachment_failure(chat_id, reply_to)
+        try:
+            attachments = await asyncio.to_thread(
+                self._prepare_attachments,
+                tuple((path, None) for path in envelope.paths),
+            )
+        except (OSError, ValueError) as error:
+            logger.warning("Email++ attachment preflight failed: %s", error)
+            return await self._send_attachment_failure(chat_id, reply_to)
+        return await self._send_prepared_parts(chat_id, body, reply_to, attachments)
+
+    async def _send_with_retry(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: str | None = None,
+        metadata: Any = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Never downgrade an attachment-bearing response to a body-only retry."""
+        _body, envelope = _decode_attachment_envelope(content)
+        if envelope is not None:
+            return await self.send(chat_id, content, reply_to, metadata)
+        return await super()._send_with_retry(
+            chat_id, content, reply_to, metadata, **kwargs
+        )
 
     async def send_image(
         self,
@@ -1177,7 +1350,9 @@ class EmailPPAdapter(BasePlatformAdapter):
         reply_to: str | None = None,
         metadata: Any = None,
     ) -> Any:
-        return await self._send_parts(chat_id, caption or "", reply_to, Path(image_url))
+        return await self._send_parts(
+            chat_id, caption or "", reply_to, ((Path(image_url), None),)
+        )
 
     async def send_document(
         self,
@@ -1190,7 +1365,7 @@ class EmailPPAdapter(BasePlatformAdapter):
         **kwargs: Any,
     ) -> Any:
         return await self._send_parts(
-            chat_id, caption or "", reply_to, Path(file_path), file_name
+            chat_id, caption or "", reply_to, ((Path(file_path), file_name),)
         )
 
     async def send_voice(
@@ -1203,7 +1378,7 @@ class EmailPPAdapter(BasePlatformAdapter):
         **kwargs: Any,
     ) -> Any:
         return await self._send_parts(
-            chat_id, caption or "", reply_to, Path(audio_path)
+            chat_id, caption or "", reply_to, ((Path(audio_path), None),)
         )
 
     async def get_chat_info(self, chat_id: str) -> dict[str, str]:
@@ -1215,8 +1390,31 @@ class EmailPPAdapter(BasePlatformAdapter):
         chat_id: str,
         content: str,
         reply_to: str | None,
-        attachment: Path | None,
-        file_name: str | None = None,
+        attachments: tuple[tuple[Path, str | None], ...],
+    ) -> Any:
+        try:
+            prepared = await asyncio.to_thread(self._prepare_attachments, attachments)
+        except (OSError, ValueError) as error:
+            return SendResult(success=False, error=str(error))
+        return await self._send_prepared_parts(chat_id, content, reply_to, prepared)
+
+    async def _send_attachment_failure(self, chat_id: str, reply_to: str | None) -> Any:
+        return await self._send_parts(
+            chat_id,
+            (
+                "I could not deliver the requested attachment(s), so no files were "
+                "attached. Please ask me to regenerate or resend them."
+            ),
+            reply_to,
+            (),
+        )
+
+    async def _send_prepared_parts(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: str | None,
+        attachments: tuple[_PreparedAttachment, ...],
     ) -> Any:
         key = (chat_id.lower(), reply_to or "")
         route = self._routes.get(key)
@@ -1235,8 +1433,8 @@ class EmailPPAdapter(BasePlatformAdapter):
                 route,
                 content,
                 reply_to or "",
-                attachment,
-                file_name,
+                attachments,
+                None,
                 outlook_reply_context,
             )
             self._remember_route(route, message_id)
@@ -1262,15 +1460,51 @@ class EmailPPAdapter(BasePlatformAdapter):
         sender = str(quote_source.get("sender", route.chat_id))
         return quote_plain(content, quote, sender), quote_html(html_body, quote, sender)
 
+    def _prepare_attachments(
+        self, attachments: tuple[tuple[Path, str | None], ...]
+    ) -> tuple[_PreparedAttachment, ...]:
+        """Revalidate and snapshot every requested file before SMTP begins."""
+        if len(attachments) > self._max_outbound_attachments:
+            raise ValueError(
+                "requested attachment count exceeds EMAIL_PP_MAX_OUTBOUND_ATTACHMENTS"
+            )
+        total = 0
+        prepared: list[_PreparedAttachment] = []
+        for path, requested_name in attachments:
+            safe_path = validate_media_delivery_path(str(path))
+            if safe_path is None:
+                raise ValueError("requested attachment is unavailable or not permitted")
+            resolved = Path(safe_path)
+            data = resolved.read_bytes()
+            total += len(data)
+            if total > self._max_outbound_total_bytes:
+                raise ValueError(
+                    "requested attachments exceed EMAIL_PP_MAX_OUTBOUND_TOTAL_BYTES"
+                )
+            filename = Path(requested_name or resolved.name).name
+            filename = filename.replace("\r", "").replace("\n", "")
+            if not filename or filename in {".", ".."}:
+                filename = "attachment"
+            content_type, _ = mimetypes.guess_type(filename)
+            maintype, subtype = (content_type or "application/octet-stream").split(
+                "/", 1
+            )
+            prepared.append(_PreparedAttachment(data, maintype, subtype, filename))
+        return tuple(prepared)
+
     def _send_email(
         self,
         route: ThreadRoute,
         content: str,
         reply_to: str,
-        attachment: Path | None,
-        file_name: str | None,
+        attachments: tuple[_PreparedAttachment, ...] | Path | None,
+        file_name: str | None = None,
         outlook_reply_context: tuple[str, str] | None = None,
     ) -> str:
+        if isinstance(attachments, Path):
+            attachments = self._prepare_attachments(((attachments, file_name),))
+        elif attachments is None:
+            attachments = ()
         reply_ids = _message_ids(reply_to)
         if len(reply_ids) != 1:
             raise ValueError("reply_to must be one valid RFC Message-ID")
@@ -1306,19 +1540,15 @@ class EmailPPAdapter(BasePlatformAdapter):
         message["Message-ID"] = message_id
         message.set_content(plain_body, charset="utf-8")
         message.add_alternative(html_body, subtype="html", charset="utf-8")
-        if attachment is not None:
-            data = attachment.read_bytes()
-            content_type, _ = mimetypes.guess_type(file_name or attachment.name)
-            maintype, subtype = (content_type or "application/octet-stream").split(
-                "/", 1
-            )
+        if attachments:
             message.make_mixed()
-            message.add_attachment(
-                data,
-                maintype=maintype,
-                subtype=subtype,
-                filename=file_name or attachment.name,
-            )
+            for attachment in attachments:
+                message.add_attachment(
+                    attachment.data,
+                    maintype=attachment.maintype,
+                    subtype=attachment.subtype,
+                    filename=attachment.filename,
+                )
         # SMTP DATA may have succeeded even if its response is lost, so keep sends
         # isolated rather than retrying or reusing a session with ambiguous state.
         smtp = self._smtp()
@@ -1326,7 +1556,10 @@ class EmailPPAdapter(BasePlatformAdapter):
             smtp.login(self._address, self._password)
             smtp.send_message(message)
         finally:
-            smtp.quit()
+            try:
+                smtp.quit()
+            except (OSError, smtplib.SMTPException):
+                logger.warning("Email++ SMTP QUIT failed after send")
         if fresh_draft:
             self._router.update_context(route, draft_context={"draft_sent": "true"})
         return message_id

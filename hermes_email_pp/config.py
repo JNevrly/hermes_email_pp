@@ -26,6 +26,8 @@ OPTIONAL_ENV = (
     "EMAIL_PP_QUOTE_MODE",
     "EMAIL_PP_PROCESS_HISTORY_WINDOW",
     "EMAIL_PP_DELETE_PROCESSED",
+    "EMAIL_PP_MAX_OUTBOUND_ATTACHMENTS",
+    "EMAIL_PP_MAX_OUTBOUND_TOTAL_BYTES",
 )
 
 # Vanilla Hermes suppresses *_ALLOW_ALL_USERS optional fields from setup cards.
@@ -152,6 +154,21 @@ CHANNEL_ENV = (
         ),
         "advanced": True,
     },
+    {
+        "name": "EMAIL_PP_MAX_OUTBOUND_ATTACHMENTS",
+        "prompt": "Maximum outbound attachments",
+        "description": "Maximum files in one agent email response. Default: 10.",
+        "advanced": True,
+    },
+    {
+        "name": "EMAIL_PP_MAX_OUTBOUND_TOTAL_BYTES",
+        "prompt": "Maximum outbound attachment bytes",
+        "description": (
+            "Maximum total raw attachment bytes before MIME encoding. "
+            "Default: 15728640 (15 MiB)."
+        ),
+        "advanced": True,
+    },
 )
 
 _CONFIG_KEYS = {
@@ -171,6 +188,8 @@ _CONFIG_KEYS = {
     "EMAIL_PP_QUOTE_MODE": "quote_mode",
     "EMAIL_PP_PROCESS_HISTORY_WINDOW": "process_history_window",
     "EMAIL_PP_DELETE_PROCESSED": "delete_processed",
+    "EMAIL_PP_MAX_OUTBOUND_ATTACHMENTS": "max_outbound_attachments",
+    "EMAIL_PP_MAX_OUTBOUND_TOTAL_BYTES": "max_outbound_total_bytes",
 }
 
 
@@ -231,6 +250,20 @@ def delete_processed(value: object) -> bool:
     raise ValueError("EMAIL_PP_DELETE_PROCESSED must be true or false")
 
 
+def outbound_attachment_limit(value: object, *, setting: str, default: int) -> int:
+    """Return a positive outbound attachment limit with a safe default."""
+    raw = str(value).strip()
+    if not raw:
+        return default
+    try:
+        limit = int(raw)
+    except ValueError as error:
+        raise ValueError(f"{setting} must be a positive integer") from error
+    if limit <= 0:
+        raise ValueError(f"{setting} must be a positive integer")
+    return limit
+
+
 def is_configured(config: Any, environ: Mapping[str, str] | None = None) -> bool:
     """Return whether isolated environment or platform config supplies all secrets."""
     extra = getattr(config, "extra", {})
@@ -251,6 +284,22 @@ def is_configured(config: Any, environ: Mapping[str, str] | None = None) -> bool
     )
     delete_processed(
         settings.get("EMAIL_PP_DELETE_PROCESSED", extra.get("delete_processed", ""))
+    )
+    outbound_attachment_limit(
+        settings.get(
+            "EMAIL_PP_MAX_OUTBOUND_ATTACHMENTS",
+            extra.get("max_outbound_attachments", ""),
+        ),
+        setting="EMAIL_PP_MAX_OUTBOUND_ATTACHMENTS",
+        default=10,
+    )
+    outbound_attachment_limit(
+        settings.get(
+            "EMAIL_PP_MAX_OUTBOUND_TOTAL_BYTES",
+            extra.get("max_outbound_total_bytes", ""),
+        ),
+        setting="EMAIL_PP_MAX_OUTBOUND_TOTAL_BYTES",
+        default=15 * 1024 * 1024,
     )
     return True
 

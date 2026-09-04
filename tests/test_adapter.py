@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import logging
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
@@ -30,7 +31,7 @@ from hermes_email_pp.forwarding import (
     is_suspected_forward,
     parse_forward,
 )
-from hermes_email_pp.rendering import _SafeHTML
+from hermes_email_pp.rendering import _SafeHTML, render_markdown
 
 
 @pytest.fixture(autouse=True)
@@ -222,6 +223,18 @@ def test_html_sanitizer_drops_unknown_tags_and_preserves_safe_entities() -> None
     sanitizer.feed('<img src="https://evil.example"><br/>&#169;')
 
     assert "".join(sanitizer.parts) == "<br>&#169;"
+
+
+def test_email_rendering_preserves_remote_images_and_local_references() -> None:
+    html = render_markdown(
+        "![Preview](http://localhost:8080/report.png) "
+        "and [local report](/workspace/report.pdf)"
+    )
+
+    assert '<a href="http://localhost:8080/report.png">Preview</a>' in html
+    assert "<img" not in html
+    assert "local report" in html
+    assert "/workspace/report.pdf" in html
 
 
 def test_tls_baseline_fetch_and_reconnect(adapter, monkeypatch) -> None:
@@ -976,6 +989,263 @@ def test_smtp_tls_and_explicit_route_send(adapter, monkeypatch, tmp_path) -> Non
             route.chat_id, str(attachment), reply_to="<inbound@example.com>"
         )
     ).success
+
+
+def test_explicit_media_envelope_sends_body_and_multiple_attachments(
+    adapter, monkeypatch, tmp_path
+) -> None:
+    smtp = SMTP()
+    monkeypatch.setattr(adapter, "_smtp", lambda: smtp)
+    first = tmp_path / "report.pdf"
+    second = tmp_path / "data.csv"
+    first.write_bytes(b"report")
+    second.write_bytes(b"name,value\nanswer,42\n")
+    route = ThreadRoute("person@example.com", "email_pp:thread")
+    adapter._routes[(route.chat_id, "<inbound@example.com>")] = route
+
+    media, content = adapter.extract_media(
+        "Attached are the requested files.\n"
+        f"MEDIA:{first}\nMEDIA:{second}\nMEDIA:{first}"
+    )
+
+    assert media == []
+    assert "MEDIA:" not in content
+    assert "email_pp_attachments:v1:" in content
+    result = asyncio.run(adapter.send(route.chat_id, content, "<inbound@example.com>"))
+
+    assert result.success
+    message = smtp.sent
+    assert message.get_content_type() == "multipart/mixed"
+    body, report, data = message.get_payload()
+    assert body.get_content_type() == "multipart/alternative"
+    assert (
+        body.get_payload()[0].get_content().strip()
+        == "Attached are the requested files."
+    )
+    assert [part.get_filename() for part in (report, data)] == [
+        "report.pdf",
+        "data.csv",
+    ]
+    assert [part.get_payload(decode=True) for part in (report, data)] == [
+        b"report",
+        b"name,value\nanswer,42\n",
+    ]
+
+
+def test_attachment_only_response_and_invalid_attachment_notice(
+    adapter, monkeypatch, tmp_path
+) -> None:
+    smtp = SMTP()
+    monkeypatch.setattr(adapter, "_smtp", lambda: smtp)
+    route = ThreadRoute("person@example.com", "email_pp:thread")
+    adapter._routes[(route.chat_id, "<inbound@example.com>")] = route
+    attachment = tmp_path / "report.txt"
+    attachment.write_bytes(b"report")
+
+    _media, content = adapter.extract_media(f"MEDIA:{attachment}")
+    result = asyncio.run(adapter.send(route.chat_id, content, "<inbound@example.com>"))
+
+    assert result.success
+    body, file_part = smtp.sent.get_payload()
+    assert body.get_payload()[0].get_content().strip() == ""
+    assert file_part.get_filename() == "report.txt"
+
+    _media, invalid = adapter.extract_media(f"MEDIA:{tmp_path / 'missing.pdf'}")
+    notice = asyncio.run(adapter.send(route.chat_id, invalid, "<inbound@example.com>"))
+
+    assert notice.success
+    assert smtp.sent.get_content_type() == "multipart/alternative"
+    assert "no files were attached" in smtp.sent.get_payload()[0].get_content()
+
+    _media, unknown = adapter.extract_media(f"MEDIA:{tmp_path / 'missing.custom'}")
+    assert adapter_module._decode_attachment_envelope(unknown)[1].invalid
+
+
+def test_email_only_attaches_explicit_media_and_enforces_limits(
+    adapter, monkeypatch, tmp_path
+) -> None:
+    first = tmp_path / "first.txt"
+    second = tmp_path / "second.txt"
+    first.write_bytes(b"one")
+    second.write_bytes(b"two")
+    text = f"Stored at {first}; visit http://localhost:8080/report.png"
+
+    assert adapter.extract_local_files(text) == ([], text)
+    assert adapter.extract_images(text) == ([], text)
+    assert adapter.extract_media(text) == ([], text)
+
+    adapter._max_outbound_attachments = 1
+    _media, content = adapter.extract_media(f"MEDIA:{first}\nMEDIA:{second}")
+    body, envelope = adapter_module._decode_attachment_envelope(content)
+
+    assert body == ""
+    assert envelope is not None and envelope.invalid
+    adapter._max_outbound_total_bytes = 2
+    with pytest.raises(ValueError, match="MAX_OUTBOUND_TOTAL_BYTES"):
+        adapter._prepare_attachments(((first, None),))
+
+
+def test_attachment_envelope_rejects_tampering_and_never_plain_text_falls_back(
+    adapter, monkeypatch
+) -> None:
+    route = ThreadRoute("person@example.com", "email_pp:thread")
+    adapter._routes[(route.chat_id, "<inbound@example.com>")] = route
+    smtp = SMTP()
+    monkeypatch.setattr(adapter, "_smtp", lambda: smtp)
+    tampered = "response\n[[email_pp_attachments:v1:not-valid-base64]]"
+
+    result = asyncio.run(
+        adapter._send_with_retry(route.chat_id, tampered, "<inbound@example.com>")
+    )
+
+    assert result.success
+    assert "no files were attached" in smtp.sent.get_payload()[0].get_content()
+    assert adapter.SUPPORTS_MESSAGE_EDITING is False
+
+    plain = asyncio.run(
+        adapter._send_with_retry(
+            route.chat_id, "ordinary reply", "<inbound@example.com>"
+        )
+    )
+    assert plain.success
+
+
+def test_attachment_envelope_bounds_and_invalid_payloads(adapter) -> None:
+    oversized_paths = tuple(Path("/" + "x" * 4000) for _ in range(5))
+    marker = adapter_module._encode_attachment_envelope(
+        adapter_module._AttachmentEnvelope(oversized_paths)
+    )
+    assert adapter_module._decode_attachment_envelope(marker)[1].invalid
+
+    def marker_for(payload: object) -> str:
+        encoded = (
+            base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
+        )
+        return f"[[email_pp_attachments:v1:{encoded}]]"
+
+    body, envelope = adapter_module._decode_attachment_envelope(
+        f"body\n{marker_for({'paths': [], 'invalid': False})}\n"
+        f"{marker_for({'paths': [], 'invalid': False})}"
+    )
+    assert body.startswith("body")
+    assert envelope is not None and envelope.invalid
+    raw = {
+        "paths": ["x" * (adapter_module._MAX_ATTACHMENT_ENVELOPE_BYTES + 1)],
+        "invalid": False,
+    }
+    assert adapter_module._decode_attachment_envelope(marker_for(raw))[1].invalid
+    assert adapter_module._decode_attachment_envelope(
+        marker_for({"paths": "not-a-list", "invalid": False})
+    )[1].invalid
+
+
+def test_attachment_preflight_rejects_direct_failures_and_safe_filename(
+    adapter, monkeypatch, tmp_path
+) -> None:
+    first = tmp_path / "first.txt"
+    second = tmp_path / "second.txt"
+    first.write_bytes(b"one")
+    second.write_bytes(b"two")
+    adapter._max_outbound_attachments = 1
+    with pytest.raises(ValueError, match="MAX_OUTBOUND_ATTACHMENTS"):
+        adapter._prepare_attachments(((first, None), (second, None)))
+    adapter._max_outbound_attachments = 10
+    monkeypatch.setattr(
+        adapter_module, "validate_media_delivery_path", lambda path: None
+    )
+    with pytest.raises(ValueError, match="not permitted"):
+        adapter._prepare_attachments(((first, None),))
+    monkeypatch.undo()
+    prepared = adapter._prepare_attachments(((first, "\r\n"),))
+    assert prepared[0].filename == "attachment"
+
+
+def test_attachment_preflight_failure_sends_notice_and_quit_failure_is_ignored(
+    adapter, monkeypatch, tmp_path
+) -> None:
+    class BrokenQuitSMTP(SMTP):
+        def quit(self) -> None:
+            raise OSError("socket closed")
+
+    smtp = BrokenQuitSMTP()
+    monkeypatch.setattr(adapter, "_smtp", lambda: smtp)
+    route = ThreadRoute("person@example.com", "email_pp:thread")
+    adapter._routes[(route.chat_id, "<inbound@example.com>")] = route
+    attachment = tmp_path / "report.txt"
+    attachment.write_bytes(b"report")
+    adapter._max_outbound_total_bytes = 1
+    content = adapter_module._append_attachment_envelope(
+        "body", adapter_module._AttachmentEnvelope((attachment,))
+    )
+
+    result = asyncio.run(adapter.send(route.chat_id, content, "<inbound@example.com>"))
+
+    assert result.success
+    assert "no files were attached" in smtp.sent.get_payload()[0].get_content()
+    assert not asyncio.run(
+        adapter.send_document(
+            route.chat_id,
+            str(tmp_path / "missing.txt"),
+            reply_to="<inbound@example.com>",
+        )
+    ).success
+
+
+def test_concurrent_attachment_envelopes_do_not_cross_between_routes(
+    adapter, monkeypatch, tmp_path
+) -> None:
+    sent: list[SMTP] = []
+
+    def smtp_factory() -> SMTP:
+        smtp = SMTP()
+        sent.append(smtp)
+        return smtp
+
+    monkeypatch.setattr(adapter, "_smtp", smtp_factory)
+    first = tmp_path / "first.txt"
+    second = tmp_path / "second.txt"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    routes = (
+        (
+            ThreadRoute("first@example.com", "email_pp:first"),
+            "<first@example.com>",
+            first,
+        ),
+        (
+            ThreadRoute("second@example.com", "email_pp:second"),
+            "<second@example.com>",
+            second,
+        ),
+    )
+    for route, reply_to, _attachment in routes:
+        adapter._routes[(route.chat_id, reply_to)] = route
+    contents = [
+        adapter_module._append_attachment_envelope(
+            "first body", adapter_module._AttachmentEnvelope((first,))
+        ),
+        adapter_module._append_attachment_envelope(
+            "second body", adapter_module._AttachmentEnvelope((second,))
+        ),
+    ]
+
+    async def send_both() -> list[object]:
+        return await asyncio.gather(
+            *(
+                adapter.send(route.chat_id, content, reply_to)
+                for (route, reply_to, _attachment), content in zip(
+                    routes, contents, strict=True
+                )
+            )
+        )
+
+    results = asyncio.run(send_both())
+
+    assert all(result.success for result in results)
+    assert {smtp.sent.get_payload()[1].get_filename() for smtp in sent} == {
+        "first.txt",
+        "second.txt",
+    }
 
 
 def test_rich_mime_quotes_safe_html_and_encoded_headers(

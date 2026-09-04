@@ -81,6 +81,8 @@ Email++ platform configuration.
 | `EMAIL_PP_QUOTE_MODE` | No | `always` | `always` quotes the source email, `forwarded` quotes only parsed forwards, and `never` omits visible quotes. |
 | `EMAIL_PP_PROCESS_HISTORY_WINDOW` | No | `0` | Unread mail recovery at a cold gateway start: `0` skips existing mail, `-1` processes all unread mail, and a positive exact-second window processes only unread mail newer than that cutoff. |
 | `EMAIL_PP_DELETE_PROCESSED` | No | `false` | Delete authorized email only after Hermes completes successfully and its reply is accepted by SMTP. Requires IMAP UIDPLUS support. |
+| `EMAIL_PP_MAX_OUTBOUND_ATTACHMENTS` | No | `10` | Maximum files attached to one agent response. |
+| `EMAIL_PP_MAX_OUTBOUND_TOTAL_BYTES` | No | `15728640` | Maximum total raw attachment bytes before MIME encoding (15 MiB). |
 
 `EMAIL_PP_ALLOW_ALL_USERS` accepts every non-automated sender and disables the
 allowlist and sender-authentication checks. Leave it disabled for an
@@ -101,6 +103,32 @@ malformed, cancelled, and failed requests. It records a successful response
 before deleting and retries a failed mailbox deletion without rerunning Hermes.
 Deletion requires IMAP `UIDPLUS`; Email++ never uses broad `EXPUNGE`, so it
 cannot remove messages another mailbox client has marked for deletion.
+
+## Generated Attachments
+
+When an email user asks to receive an asset, the agent must emit an explicit
+`MEDIA:/absolute/path/to/file` directive after creating it. Email++ removes the
+directive from the visible response and attaches every validated `MEDIA:` file
+to the same MIME email as the response body. A Markdown link, local path, file
+URL, or localhost URL is not a substitute when the asset itself was requested.
+
+Local paths and local HTTP URLs remain valid informational references. The
+agent can attach an asset and also mention where it is stored when both are
+useful. Bare paths are never auto-attached by Email++, and remote image URLs
+remain links rather than being downloaded by the adapter.
+
+Email++ sends final responses only after they are complete because SMTP cannot
+edit an accepted message. Configure `display.platforms.email_pp.streaming` as
+`false` and disable optional progress messages when one final email per turn is
+required. Attachment delivery supports at most 10 files and 15 MiB of raw data
+by default; configure `EMAIL_PP_MAX_OUTBOUND_ATTACHMENTS` and
+`EMAIL_PP_MAX_OUTBOUND_TOTAL_BYTES` for providers with different limits.
+
+If any requested attachment is missing, unsafe, unreadable, or exceeds a
+limit, Email++ sends a threaded failure notice without attaching a partial set
+of files. This plugin-only behavior relies on Hermes Agent 0.20.5 calling the
+adapter extraction hooks before its final text send; update compatibility tests
+before upgrading Hermes.
 
 ## Email Behavior
 

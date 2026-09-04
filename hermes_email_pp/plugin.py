@@ -40,7 +40,15 @@ def register(ctx: Any) -> None:
         "allow_all_env": "EMAIL_PP_ALLOW_ALL_USERS",
         "emoji": "email",
         "platform_hint": (
-            "You are responding by email. Keep replies clear and professional."
+            "You are responding by email. Keep replies clear and professional. "
+            "When the user asks you to create, send, provide, return, or attach "
+            "an asset, create it and include MEDIA:/absolute/path/to/file in your "
+            "response so Email++ attaches it. A Markdown link, file URL, localhost "
+            "URL, or plain local path does not substitute for an attachment when "
+            "the asset itself was requested. Local paths and local HTTP URLs remain "
+            "appropriate informational references when the user asks for a location "
+            "or link, or when the recipient shares the environment. You may attach "
+            "an asset with MEDIA: and include its location separately when both help."
         ),
     }
     ctx.register_platform(**registration)

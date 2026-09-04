@@ -24,6 +24,7 @@ from hermes_email_pp.config import (
     delete_processed,
     environment_enablement,
     is_configured,
+    outbound_attachment_limit,
     process_history_window,
 )
 from hermes_email_pp.plugin import check_requirements, create_adapter, register
@@ -173,6 +174,8 @@ def test_registers_email_pp_with_isolated_access_control() -> None:
     assert context.registration["required_env"] == list(CHANNEL_REQUIRED_ENV)
     assert context.registration["allowed_users_env"] == "EMAIL_PP_ALLOWED_USERS"
     assert context.registration["allow_all_env"] == "EMAIL_PP_ALLOW_ALL_USERS"
+    assert "MEDIA:/absolute/path/to/file" in context.registration["platform_hint"]
+    assert "localhost" in context.registration["platform_hint"]
 
 
 def test_registers_without_vanilla_channel_metadata(monkeypatch) -> None:
@@ -234,6 +237,8 @@ def test_channel_environment_metadata_covers_every_email_pp_setting() -> None:
         in fields["EMAIL_PP_REQUIRE_AUTHENTICATED_SENDER"]["description"]
     )
     assert "always, forwarded, or never" in fields["EMAIL_PP_QUOTE_MODE"]["description"]
+    assert fields["EMAIL_PP_MAX_OUTBOUND_ATTACHMENTS"]["advanced"] is True
+    assert "15 MiB" in fields["EMAIL_PP_MAX_OUTBOUND_TOTAL_BYTES"]["description"]
 
 
 def test_configuration_never_reads_builtin_email_settings(monkeypatch) -> None:
@@ -323,6 +328,30 @@ def test_processed_mail_deletion_validation_and_environment_mapping(
     assert environment_enablement()["delete_processed"] == "true"
     monkeypatch.setenv("EMAIL_PP_DELETE_PROCESSED", "invalid")
     with pytest.raises(ValueError, match="DELETE_PROCESSED"):
+        is_configured(SimpleNamespace(extra={}))
+
+
+def test_outbound_attachment_limit_validation_and_environment_mapping(
+    monkeypatch,
+) -> None:
+    assert outbound_attachment_limit("", setting="TEST", default=10) == 10
+    assert outbound_attachment_limit("3", setting="TEST", default=10) == 3
+    for value in ("0", "-1", "invalid"):
+        with pytest.raises(ValueError, match="TEST"):
+            outbound_attachment_limit(value, setting="TEST", default=10)
+    for name, value in zip(
+        REQUIRED_ENV,
+        ("agent@example.com", "secret", "imap.example.com", "smtp.example.com"),
+        strict=True,
+    ):
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("EMAIL_PP_MAX_OUTBOUND_ATTACHMENTS", "3")
+    monkeypatch.setenv("EMAIL_PP_MAX_OUTBOUND_TOTAL_BYTES", "1024")
+
+    assert environment_enablement()["max_outbound_attachments"] == "3"
+    assert environment_enablement()["max_outbound_total_bytes"] == "1024"
+    monkeypatch.setenv("EMAIL_PP_MAX_OUTBOUND_ATTACHMENTS", "0")
+    with pytest.raises(ValueError, match="MAX_OUTBOUND_ATTACHMENTS"):
         is_configured(SimpleNamespace(extra={}))
 
 

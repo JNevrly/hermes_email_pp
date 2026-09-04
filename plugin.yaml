@@ -43,3 +43,7 @@ optional_env:
     description: "Unread cold-start recovery in seconds: 0 skips existing mail, -1 processes all, positive values process only recent mail. Default: 0."
   - name: EMAIL_PP_DELETE_PROCESSED
     description: "Enter true to delete authorized email only after Hermes completes and its reply is accepted by SMTP. Default: false."
+  - name: EMAIL_PP_MAX_OUTBOUND_ATTACHMENTS
+    description: "Maximum files attached to one agent email response. Default: 10."
+  - name: EMAIL_PP_MAX_OUTBOUND_TOTAL_BYTES
+    description: "Maximum total raw attachment bytes before MIME encoding. Default: 15728640 (15 MiB)."

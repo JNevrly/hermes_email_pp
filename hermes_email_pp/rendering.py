@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import re
 from html.parser import HTMLParser
 from urllib.parse import urlsplit
 
@@ -35,6 +36,23 @@ _ALLOWED_TAGS = {
     "ul",
 }
 _SAFE_LINK_SCHEMES = {"http", "https", "mailto"}
+_LOCAL_MARKDOWN_LINK = r"\[([^\]]*)\]\(((?:~/|/|[A-Za-z]:[/\\])[^)\s]+)\)"
+_MARKDOWN_IMAGE = r"!\[([^\]]*)\]\(([^)\s]+)\)"
+
+
+def _email_markdown(body: str) -> str:
+    """Keep image URLs and local-path references visible without fetching them."""
+
+    def image_link(match: re.Match[str]) -> str:
+        label, target = match.groups()
+        return f"[{label or target}]({target})"
+
+    def local_link(match: re.Match[str]) -> str:
+        label, target = match.groups()
+        return f"{label or target} (`{target}`)"
+
+    body = re.sub(_MARKDOWN_IMAGE, image_link, body)
+    return re.sub(_LOCAL_MARKDOWN_LINK, local_link, body)
 
 
 class _SafeHTML(HTMLParser):
@@ -77,7 +95,9 @@ class _SafeHTML(HTMLParser):
 def render_markdown(body: str) -> str:
     """Convert Markdown to inert HTML without trusting model-provided HTML."""
     rendered = markdown.markdown(
-        html.escape(body), extensions=["tables", "fenced_code"], output_format="html"
+        html.escape(_email_markdown(body)),
+        extensions=["tables", "fenced_code"],
+        output_format="html",
     )
     sanitizer = _SafeHTML()
     sanitizer.feed(rendered)
