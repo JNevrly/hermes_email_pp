@@ -1,5 +1,10 @@
 # History
 
+## 0.5.1 (2026-10-24)
+
+* Allow Python 3.14 by raising the supported Python upper bound to 3.15.
+* Add isolated Python 3.14 test coverage alongside Python 3.13.
+
 ## 0.5.0 (2026-09-04)
 
 * Support configurable sender names for outgoing replies.
