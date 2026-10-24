@@ -1,5 +1,11 @@
 # History
 
+## 0.5.2 (2026-10-24)
+
+* Require Python 3.13 or newer without an upper version bound.
+* Remove speculative dependency upper bounds to ease Hermes upgrades.
+* Validate with Ruff 0.15.10 while keeping reproducible development versions in the lockfile.
+
 ## 0.5.1 (2026-10-24)
 
 * Allow Python 3.14 by raising the supported Python upper bound to 3.15.

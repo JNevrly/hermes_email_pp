@@ -216,6 +216,14 @@ forwarded-message sender.
 
 ## Development Validation
 
+Email++ requires Python 3.13 or newer. Python and package requirements use
+minimum versions without speculative upper bounds, so Hermes can select newer
+compatible dependencies. Add a ceiling only for a demonstrated incompatibility.
+`uv.lock` records the exact development versions used by locked validation;
+broader requirements do not automatically upgrade an existing lockfile. Ruff is
+a development dependency, not a runtime requirement of the installed plugin.
+See [the dependency policy](docs/adr/0001-use-minimum-dependency-versions.md).
+
 Run the complete release checks with an editable Hermes Agent v0.20.5 source
 checkout installed into the development environment:
 

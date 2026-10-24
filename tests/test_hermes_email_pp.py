@@ -61,8 +61,8 @@ def test_project_declares_email_pp_entry_point() -> None:
     assert project["project"]["entry-points"]["hermes_agent.plugins"] == {
         "email-pp": "hermes_email_pp.plugin"
     }
-    assert project["project"]["requires-python"] == ">=3.11,<3.15"
-    assert project["project"]["dependencies"] == ["markdown>=3.10,<4.0"]
+    assert project["project"]["requires-python"] == ">=3.13"
+    assert project["project"]["dependencies"] == ["markdown>=3.10"]
 
 
 def test_root_directory_plugin_manifest_and_loader() -> None:
