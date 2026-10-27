@@ -94,11 +94,14 @@ class _SafeHTML(HTMLParser):
 
 def render_markdown(body: str) -> str:
     """Convert Markdown to inert HTML without trusting model-provided HTML."""
-    rendered = markdown.markdown(
-        html.escape(_email_markdown(body)),
+    parser = markdown.Markdown(
         extensions=["tables", "fenced_code"],
         output_format="html",
     )
+    # Escape raw HTML during serialization, without breaking Markdown link syntax.
+    parser.preprocessors.deregister("html_block")
+    parser.inlinePatterns.deregister("html")
+    rendered = parser.convert(_email_markdown(body))
     sanitizer = _SafeHTML()
     sanitizer.feed(rendered)
     sanitizer.close()

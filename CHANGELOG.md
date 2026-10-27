@@ -1,5 +1,10 @@
 # History
 
+## 0.5.3 (2026-10-27)
+
+* Preserve angle-bracket Markdown link destinations, including query parameters and tokens.
+* Keep raw HTML escaped and unsafe link schemes blocked in outgoing email.
+
 ## 0.5.2 (2026-10-24)
 
 * Require Python 3.13 or newer without an upper version bound.

@@ -1271,6 +1271,8 @@ def test_rich_mime_quotes_safe_html_and_encoded_headers(
 
 **bold** and *emphasis* with [safe](https://example.com) and [bad](javascript:alert(1)).
 
+[Review and sign document.pdf](<http://127.0.0.1:18781/?token=A%2BB%26C&document=review.pdf>)
+
 - first
 - second
 
@@ -1301,6 +1303,10 @@ print("code")
     for expected in ("<h1>", "<strong>", "<em>", "<ul>", "<ol>", "<table>", "<code>"):
         assert expected in html_body
     assert '<a href="https://example.com">safe</a>' in html_body
+    assert (
+        '<a href="http://127.0.0.1:18781/?token=A%2BB%26C&amp;document=review.pdf">'
+        "Review and sign document.pdf</a>"
+    ) in html_body
     assert "javascript:" not in html_body
     assert "<script" not in html_body
     assert "<form" not in html_body
