@@ -1,5 +1,11 @@
 # History
 
+## 0.5.4 (2026-11-16)
+
+* Accept valid attachment-only inline forwards while preserving empty original bodies and wrapper-task isolation.
+* Report specific forward rejection reasons instead of a generic boundary warning.
+* Retain parser-rejected emails even after successfully delivering a rejection notice.
+
 ## 0.5.3 (2026-10-27)
 
 * Preserve angle-bracket Markdown link destinations, including query parameters and tokens.

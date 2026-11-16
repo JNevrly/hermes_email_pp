@@ -166,7 +166,10 @@ Outlook/O365 HTML forwards using an `hr` followed by the standard
 `divRplyFwdMsg` header block are also supported.
 
 Use a short task prompt before the boundary, followed by a complete forwarded
-message with at least `From`, `Subject`, and a non-empty body. The first Hermes
+message with at least `From`, `Subject`, a blank line after the headers, and
+either original body text or an available attachment. An attachment-only
+original keeps its empty body. Only the wrapper task is instructions; forwarded
+content and attachments are reference data. The first Hermes
 response is sent only to the forwarder as a threaded reply with subject
 `Re: <forwarding subject>`. It uses standard `In-Reply-To` and `References`
 headers; when a forwarding wrapper has valid Outlook conversation headers, it
@@ -177,10 +180,13 @@ session and is sent as a normal revision.
 
 Only English Gmail and Outlook inline forwards matching the boundaries above
 are supported. Attachments-as-forwards, localized client formatting, nested or
-ambiguous forwards, and forwards without the required headers/body are not
-parsed. A suspected forward that cannot be parsed receives a safe notice and
-creates no draft or agent task. This fail-closed behavior prevents wrapper text
-or untrusted forwarded content from being mistaken for an instruction.
+ambiguous forwards, and forwards without the required headers or content are
+not parsed. A suspected forward that cannot be parsed receives a notice with
+the rejection reason and creates no draft or agent task. Rejected messages
+remain in the mailbox, marked as seen, even when processed-mail deletion is
+enabled and the rejection notice is delivered successfully. This fail-closed
+behavior prevents wrapper text or untrusted forwarded content from being
+mistaken for an instruction.
 
 ## Security And Data Handling
 

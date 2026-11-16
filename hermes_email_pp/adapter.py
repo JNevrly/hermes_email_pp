@@ -51,10 +51,11 @@ from .config import (
 )
 from .forwarding import (
     ForwardedMessage,
+    ForwardFailure,
     hermes_prompt,
     html_to_text,
     is_suspected_forward,
-    parse_forward,
+    parse_forward_result,
 )
 from .rendering import quote_html, quote_plain, render_markdown
 from .threading import (
@@ -970,8 +971,14 @@ class EmailPPAdapter(BasePlatformAdapter):
             references = _message_ids(message.get("In-Reply-To", ""))
         if message_ids:
             references.append(message_ids[0])
-        forward = self._forward(alternatives)
-        if forward is None and is_suspected_forward(subject, alternatives):
+        parsed = self._forward(alternatives, has_attachments=bool(urls))
+        forward = parsed if isinstance(parsed, ForwardedMessage) else None
+        if isinstance(parsed, ForwardFailure) and is_suspected_forward(
+            subject, alternatives
+        ):
+            logger.info(
+                "Email++ rejected inline forward (reason=%s)", parsed.name.lower()
+            )
             self._router.update_context(
                 route,
                 delivery_context={
@@ -981,12 +988,9 @@ class EmailPPAdapter(BasePlatformAdapter):
                 quote_source={"body": "", "is_forwarded": "false"},
                 draft_context={"is_forwarded": "false", "draft_sent": "true"},
             )
-            sent_notice = await self._send_unsafe_forward_notice(route, message_id)
             if self._delete_processed and delivery is not None:
-                if sent_notice:
-                    await asyncio.to_thread(self._remember_processed_delivery, delivery)
-                else:
-                    await asyncio.to_thread(self._mark_seen, delivery)
+                await asyncio.to_thread(self._mark_seen, delivery)
+            await self._send_unsafe_forward_notice(route, message_id, parsed)
             return
         self._router.update_context(
             route,
@@ -1152,10 +1156,17 @@ class EmailPPAdapter(BasePlatformAdapter):
         return alternatives
 
     @staticmethod
-    def _forward(alternatives: list[str]) -> ForwardedMessage | None:
-        return next(
-            (forward for body in alternatives if (forward := parse_forward(body))), None
-        )
+    def _forward(
+        alternatives: list[str], *, has_attachments: bool = False
+    ) -> ForwardedMessage | ForwardFailure:
+        failure = ForwardFailure.UNSUPPORTED_FORMAT
+        for body in alternatives:
+            result = parse_forward_result(body, has_attachments=has_attachments)
+            if isinstance(result, ForwardedMessage):
+                return result
+            if result is not ForwardFailure.UNSUPPORTED_FORMAT:
+                failure = result
+        return failure
 
     @staticmethod
     def _draft_context(forward: ForwardedMessage | None) -> dict[str, str]:
@@ -1174,16 +1185,15 @@ class EmailPPAdapter(BasePlatformAdapter):
         }
 
     async def _send_unsafe_forward_notice(
-        self, route: ThreadRoute, message_id: str
+        self, route: ThreadRoute, message_id: str, reason: ForwardFailure
     ) -> bool:
         reply_ids = _message_ids(message_id)
         if len(reply_ids) != 1:
             return False
         content = (
-            "I could not safely identify the boundary between your task and "
-            "the forwarded message, so no review draft was created. Please "
-            "resend it with a separate task prompt followed by a complete "
-            "Gmail or Outlook inline forward."
+            f"{reason.value} No review draft was created. Please resend it with a "
+            "separate task prompt followed by a complete Gmail or Outlook inline "
+            "forward, including the original body or attachments."
         )
         sent = await asyncio.to_thread(
             self._send_email, route, content, reply_ids[0], None, None
